@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 from ..config.enums import FixedScrapingType
 from ..config.models import Language, Website
+from ..crawlers.theporndb_knowledge import find_known_entities, load_known_entities
 from ..gen.field_enums import CrawlerResultFields
 from ..manual import ManualConfig
 from ..models.enums import FileMode
@@ -13,6 +14,7 @@ from ..models.flags import Flags
 from ..models.log_buffer import LogBuffer
 from ..models.types import CrawlerInput, CrawlerResponse, CrawlerResult, CrawlersResult, CrawlTask
 from ..number import is_uncensored
+from ..signals import signal
 from ..utils.dataclass import update
 from .mosaic import is_guochan_mosaic, is_plain_uncensored_mosaic, normalize_mosaic
 
@@ -68,6 +70,7 @@ class ScrapeClassification:
     sites: list[Website] | set[Website] | None = None
     website: Website | None = None
     mosaic: str = ""
+    reason: str = ""
 
 
 def classify_scrape_task(task_input: CrawlTask, config: "Config", use_fixed_type: bool = True) -> ScrapeClassification:
@@ -86,53 +89,114 @@ def classify_scrape_task(task_input: CrawlTask, config: "Config", use_fixed_type
         FixedScrapingType.GUOCHAN: config.website_guochan,
     }
     if use_fixed_type and fixed_type != FixedScrapingType.AUTO:
-        return ScrapeClassification(fixed_type, "fixed", sites=fixed_sites[fixed_type])
+        return ScrapeClassification(
+            fixed_type, "fixed", sites=fixed_sites[fixed_type], reason="用户固定的刮削类型优先于自动识别"
+        )
 
     if (
         is_guochan_mosaic(mosaic)
         or (re.search(r"([^A-Z]|^)MD[A-Z-]*\d{4,}", file_number) and "MDVR" not in file_number)
         or re.search(r"MKY-[A-Z]+-\d{3,}", file_number)
     ):
-        return ScrapeClassification(FixedScrapingType.GUOCHAN, "auto", sites=config.website_guochan, mosaic="国产")
+        return ScrapeClassification(
+            FixedScrapingType.GUOCHAN,
+            "auto",
+            sites=config.website_guochan,
+            mosaic="国产",
+            reason="命中国产片番号/马赛克规则",
+        )
 
     if file_number.startswith("KIN8"):
-        return ScrapeClassification(FixedScrapingType.YOUMA, "auto", website=Website.KIN8)
+        return ScrapeClassification(FixedScrapingType.YOUMA, "auto", website=Website.KIN8, reason="番号前缀 KIN8")
 
     if file_number.startswith("DLID"):
-        return ScrapeClassification(FixedScrapingType.AUTO, "auto", website=Website.GETCHU)
+        return ScrapeClassification(FixedScrapingType.AUTO, "auto", website=Website.GETCHU, reason="番号前缀 DLID")
 
     if "getchu" in file_path_str or "里番" in file_path_str or "裏番" in file_path_str:
-        return ScrapeClassification(FixedScrapingType.AUTO, "auto", website=Website.GETCHU_DMM)
+        return ScrapeClassification(
+            FixedScrapingType.AUTO, "auto", website=Website.GETCHU_DMM, reason="路径命中 Getchu/里番关键词"
+        )
 
     if "mywife" in file_path_str:
-        return ScrapeClassification(FixedScrapingType.YOUMA, "auto", website=Website.MYWIFE)
+        return ScrapeClassification(FixedScrapingType.YOUMA, "auto", website=Website.MYWIFE, reason="路径命中 mywife")
 
     if "FC2" in file_number.upper():
         file_number_1 = re.search(r"\d{5,}", file_number)
         if file_number_1:
-            return ScrapeClassification(FixedScrapingType.FC2, "auto", sites=config.website_fc2)
+            return ScrapeClassification(
+                FixedScrapingType.FC2, "auto", sites=config.website_fc2, reason="FC2 番号包含 5 位以上数字"
+            )
         if not use_fixed_type:
-            return ScrapeClassification(FixedScrapingType.AUTO, "auto")
+            return ScrapeClassification(FixedScrapingType.AUTO, "auto", reason="指定站点模式下的 FC2 未识别")
         raise Exception(f"未识别的 FC2 番号: {file_number}")
 
     if re.search(r"[^.]+\.\d{2}\.\d{2}\.\d{2}", file_number) or (
         "欧美" in file_path_str and "东欧美" not in file_path_str
     ):
-        return ScrapeClassification(FixedScrapingType.OUMEI, "auto", sites=config.website_oumei)
+        return ScrapeClassification(
+            FixedScrapingType.OUMEI,
+            "auto",
+            sites=config.website_oumei,
+            reason="命中欧美日期编号格式或欧美路径关键词",
+        )
+
+    # 欧美特征未直接识别时，以欧美专用实体词典作为该分类的补充兜底。
+    # 只检查影片文件名；父目录不能影响分类。
+    western_dictionary_note = "未检查欧美实体词典（缺少文件路径）"
+    if file_path:
+        matched_entities = find_known_entities(file_path, load_known_entities())
+        if matched_entities.sites or matched_entities.studios or matched_entities.performers:
+            matched_summary = (
+                f"site={','.join(matched_entities.sites) or '-'}; "
+                f"studio={','.join(matched_entities.studios) or '-'}; "
+                f"performer={','.join(matched_entities.performers) or '-'}"
+            )
+            return ScrapeClassification(
+                FixedScrapingType.OUMEI,
+                "auto",
+                sites=config.website_oumei,
+                reason=f"自动规则未先识别欧美；文件名命中欧美实体词典（{matched_summary}）",
+            )
+        western_dictionary_note = "影片文件名未命中欧美实体词典"
 
     if is_plain_uncensored_mosaic(mosaic):
-        return ScrapeClassification(FixedScrapingType.WUMA, "auto", sites=config.website_wuma)
+        return ScrapeClassification(
+            FixedScrapingType.WUMA,
+            "auto",
+            sites=config.website_wuma,
+            reason=f"命中无码马赛克规则；{western_dictionary_note}",
+        )
 
     if _is_suren_number(file_number, task_input.short_number):
-        return ScrapeClassification(FixedScrapingType.SUREN, "auto", sites=config.website_suren)
+        return ScrapeClassification(
+            FixedScrapingType.SUREN,
+            "auto",
+            sites=config.website_suren,
+            reason=f"命中素人番号/短番号规则；{western_dictionary_note}",
+        )
 
     if is_uncensored(file_number):
-        return ScrapeClassification(FixedScrapingType.WUMA, "auto", sites=config.website_wuma)
+        return ScrapeClassification(
+            FixedScrapingType.WUMA,
+            "auto",
+            sites=config.website_wuma,
+            reason=f"番号命中无码规则；{western_dictionary_note}",
+        )
 
     if re.match(r"\D{2,}00\d{3,}", file_number) and "-" not in file_number and "_" not in file_number:
-        return ScrapeClassification(FixedScrapingType.YOUMA, "auto", sites={Website.DMM})
+        return ScrapeClassification(
+            FixedScrapingType.YOUMA,
+            "auto",
+            sites={Website.DMM},
+            reason=f"命中有码 DMM 番号格式；{western_dictionary_note}",
+        )
 
-    return ScrapeClassification(FixedScrapingType.YOUMA, "auto", sites=config.website_youma)
+    return ScrapeClassification(
+        FixedScrapingType.YOUMA,
+        "auto",
+        sites=config.website_youma,
+        reason=f"所有显式类型规则及欧美实体词典均未命中，采用原日本有码默认兜底；{western_dictionary_note}",
+    )
 
 
 def apply_scrape_classification(result: CrawlersResult, classification: ScrapeClassification) -> None:
@@ -256,6 +320,113 @@ class FileScraper:
             return data
         return all_res.get((site, Language.UNDEFINED))
 
+    @staticmethod
+    def _redact_audit_text(value: object) -> str:
+        text = " ".join(str(value).splitlines()).strip()
+        text = re.sub(
+            r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?)[^\s,;\"']+",
+            r"\1[redacted]",
+            text,
+        )
+        text = re.sub(r"(?i)\bBearer\s+[^\s,;\"']+", "Bearer [redacted]", text)
+        text = re.sub(
+            r"(?i)([?&](?:api[_-]?key|api[_-]?token|access[_-]?token|refresh[_-]?token|token|key|signature|policy|x-amz-signature|x-amz-credential)=)[^&\s]+",
+            r"\1[redacted]",
+            text,
+        )
+        text = re.sub(
+            r"(?i)([\"']?(?:theporndb_api_token|api[_-]?token|access[_-]?token)[\"']?\s*[:=]\s*[\"']?)[^\s,;}\"']+",
+            r"\1[redacted]",
+            text,
+        )
+        return text[:1200] + ("…" if len(text) > 1200 else "")
+
+    @classmethod
+    def _write_theporndb_audit(
+        cls, task_input: CrawlerInput, response: CrawlerResponse, detail_log_enabled: bool = False
+    ) -> None:
+        """Persist ordered ThePornDB diagnostics for both successful and failed lookups."""
+        info = response.debug_info
+        status = "成功" if response.data is not None else "失败"
+        file_path = task_input.file_path or "-"
+        lines = [
+            f"\n 🧾 [ThePornDB 匹配审计] file={file_path} number={task_input.number} "
+            f"status={status} elapsed={info.execution_time:.2f}s steps={len(info.logs)}"
+        ]
+        if info.error:
+            lines.append(f"    最终错误: {type(info.error).__name__}: {cls._redact_audit_text(info.error)}")
+        if response.data is not None:
+            data = response.data
+            lines.append(
+                "    最终数据: "
+                f"title={cls._redact_audit_text(data.title or '-')}; "
+                f"external_id={cls._redact_audit_text(data.external_id or '-')}; "
+                f"source={cls._redact_audit_text(data.source or '-')}"
+            )
+        lines.extend(
+            f"    [{index:03d}] {cls._redact_audit_text(message)}"
+            for index, message in enumerate(info.logs, start=1)
+        )
+        if info.search_urls:
+            lines.append("    搜索请求: " + " | ".join(cls._redact_audit_text(url) for url in info.search_urls))
+        if info.detail_urls:
+            lines.append("    详情请求: " + " | ".join(cls._redact_audit_text(url) for url in info.detail_urls))
+        audit = "\n".join(lines)
+        LogBuffer.log().write(audit)
+        if not detail_log_enabled:
+            signal.show_log_text(audit)
+
+    @classmethod
+    def _write_javbus_failure_audit(
+        cls, task_input: CrawlerInput, response: CrawlerResponse, detail_log_enabled: bool = False
+    ) -> None:
+        """Persist JavBus search diagnostics when the crawler does not find a record."""
+        info = response.debug_info
+        lines = [
+            f"\n 🧾 [JavBus 匹配审计] file={task_input.file_path or '-'} "
+            f"number={task_input.number} status=失败 elapsed={info.execution_time:.2f}s steps={len(info.logs)}"
+        ]
+        if info.error:
+            lines.append(f"    最终错误: {type(info.error).__name__}: {cls._redact_audit_text(info.error)}")
+        lines.extend(
+            f"    [{index:03d}] {cls._redact_audit_text(message)}"
+            for index, message in enumerate(info.logs, start=1)
+        )
+        if info.search_urls:
+            lines.append("    搜索请求: " + " | ".join(cls._redact_audit_text(url) for url in info.search_urls))
+        if info.detail_urls:
+            lines.append("    详情请求: " + " | ".join(cls._redact_audit_text(url) for url in info.detail_urls))
+        audit = "\n".join(lines)
+        LogBuffer.log().write(audit)
+        if not detail_log_enabled:
+            signal.show_log_text(audit)
+
+    @staticmethod
+    def _write_route_audit(
+        task_input: CrawlTask,
+        classification: ScrapeClassification,
+        forced_website: Website | None = None,
+        detail_log_enabled: bool = False,
+    ) -> None:
+        if forced_website:
+            target = forced_website.value
+            reason = f"单站调用指定站点；自动分类参考：{classification.reason or '-'}"
+        elif classification.website:
+            target = classification.website.value
+            reason = classification.reason or "专用爬虫分类"
+        else:
+            target = ",".join(sorted(site.value for site in (classification.sites or []))) or "-"
+            reason = classification.reason or "未提供分类原因"
+        audit = (
+            "\n 🔎 [刮削路由审计] "
+            f"file={task_input.file_path or '-'} number={task_input.number} "
+            f"mosaic={task_input.mosaic or '-'} type={classification.scraping_type.value} "
+            f"source={classification.scraping_type_source} target={target} reason={reason}"
+        )
+        LogBuffer.log().write(audit)
+        if not detail_log_enabled:
+            signal.show_log_text(audit)
+
     async def _call_crawler(
         self, task_input: CrawlerInput, website: Website, timeout: float | None = 30
     ) -> CrawlerResponse:
@@ -284,7 +455,23 @@ class FileScraper:
             # 移除外层超时限制，让内层的 GatherGroup 处理超时和重试
             # 原有的超时机制已由各个 HTTP 请求单独处理
             r = await c.run(task_input)
+            if website == Website.THEPORNDB:
+                self._write_theporndb_audit(task_input, r, detail_log_enabled=self.config.show_web_log)
+            elif website == Website.JAVBUS and r.data is None:
+                self._write_javbus_failure_audit(task_input, r, detail_log_enabled=self.config.show_web_log)
             return r
+        except Exception as e:
+            if website in (Website.THEPORNDB, Website.JAVBUS):
+                audit_title = "ThePornDB" if website == Website.THEPORNDB else "JavBus"
+                audit = (
+                    f"\n 🧾 [{audit_title} 匹配审计] "
+                    f"file={task_input.file_path or '-'} number={task_input.number} "
+                    f"crawler-call-exception={type(e).__name__}: {self._redact_audit_text(e)}"
+                )
+                LogBuffer.log().write(audit)
+                if not self.config.show_web_log:
+                    signal.show_log_text(audit)
+            raise
         finally:
             task_input.number = original_number
 
@@ -421,6 +608,10 @@ class FileScraper:
 
         # 所有来源均失败
         if len(all_res) == 0:
+            failure_audit = "所有配置来源均未返回影片数据。"
+            if reduced.field_log:
+                failure_audit += "\n" + reduced.field_log
+            LogBuffer.error().write(failure_audit)
             return None
 
         if use_type_field_config and hasattr(self.config, "get_type_field_config"):
@@ -593,6 +784,9 @@ class FileScraper:
 
         if website is None:  # 从全部网站刮削
             classification = classify_scrape_task(task_input, self.config)
+            self._write_route_audit(
+                task_input, classification, detail_log_enabled=self.config.show_web_log
+            )
             if classification.mosaic:
                 task_input.mosaic = classification.mosaic
                 mosaic = classification.mosaic
@@ -604,6 +798,12 @@ class FileScraper:
                 res = await self._call_crawlers(task_input, classification)
         else:
             classification = classify_scrape_task(task_input, self.config, use_fixed_type=False)
+            self._write_route_audit(
+                task_input,
+                classification,
+                forced_website=website,
+                detail_log_enabled=self.config.show_web_log,
+            )
             res = await self._call_specific_crawler(task_input, website)
 
         # ================================================网站请求结束================================================

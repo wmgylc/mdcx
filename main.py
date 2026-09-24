@@ -9,6 +9,7 @@ from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication
 
 from mdcx.consts import IS_DOCKER, IS_MAC, IS_NFC, IS_PYINSTALLER, IS_WINDOWS, MAIN_PATH
+from mdcx.control_server import ScrapeControlServer
 from mdcx.controllers.main_window.main_window import MyMAinWindow
 from mdcx.controllers.main_window.style import apply_application_palette
 from mdcx.utils.video import VIDEO_BACKEND
@@ -47,6 +48,9 @@ if platform.system() != "Windows":
 ui = MyMAinWindow()
 ui.show()
 app.installEventFilter(ui)
+control_server = ScrapeControlServer(ui)
+control_server.start()
+app.aboutToQuit.connect(control_server.stop)
 # newWin2 = CutWindow()
 try:
     sys.exit(app.exec())

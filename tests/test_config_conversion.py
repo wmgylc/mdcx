@@ -278,6 +278,18 @@ def test_builtin_naming_templates_are_migrated_to_jinja2_syntax():
     assert data["update_c_filetemplate"] == "{{ number }}"
     assert data["update_d_folder"] == "{{ number }} {{ actor }}"
     assert data["update_titletemplate"] == "{{ number }} {{ title }}"
+
+
+def test_custom_legacy_naming_fields_are_migrated_to_jinja2_syntax():
+    data = {
+        "folder_name": "#actor/[number] originaltitle",
+        "naming_file": "number-originaltitle",
+    }
+
+    Config.update(data)
+
+    assert data["folder_name"] == "#{{ actor }}/[{{ number }}] {{ originaltitle }}"
+    assert data["naming_file"] == "{{ number }}-{{ originaltitle }}"
     Config.model_validate(data)
 
 

@@ -1,8 +1,11 @@
+import os
 import platform
 import sys
 from pathlib import Path
 
 LOCAL_VERSION = 220260517
+
+CONTROL_ONLY = os.getenv("MDCX_CONTROL_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}
 
 GITHUB_REPO = "Hazard804/mdcx"
 GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"

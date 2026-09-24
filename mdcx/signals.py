@@ -17,6 +17,8 @@ class Signals(QObject):
     exec_set_main_info = pyqtSignal(ShowData)  # 主界面更新番号信息
     change_buttons_status = pyqtSignal()
     reset_buttons_status = pyqtSignal()
+    scrape_started = pyqtSignal()
+    scrape_finished = pyqtSignal()
     set_label_file_path = pyqtSignal(str)
     label_result = pyqtSignal(str)
     logs_failed_settext = pyqtSignal(str)  # 失败面板添加信息日志信号

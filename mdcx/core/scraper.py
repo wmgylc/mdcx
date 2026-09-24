@@ -26,6 +26,7 @@ from ..config.extend import get_movie_path_setting, parse_media_paths
 from ..config.manager import manager
 from ..config.resources import resources
 from ..crawler import CrawlerProvider
+from ..crawlers.theporndb_knowledge import remember_entities
 from ..models.enums import FileMode
 from ..models.flags import FileDoneDict, Flags
 from ..models.log_buffer import LogBuffer
@@ -144,7 +145,10 @@ class Scraper:
         try:
             await self._run(file_mode, movie_list)
         finally:
-            await self.crawler_provider.close()
+            try:
+                await self.crawler_provider.close()
+            finally:
+                signal.scrape_finished.emit()
 
     async def _run(self, file_mode: FileMode, movie_list: list[Path] | None) -> None:
         Flags.reset()
@@ -415,6 +419,10 @@ class Scraper:
                 signal.show_list_name("succ", show_data, number)
             else:
                 Flags.fail_count += 1
+                if not LogBuffer.error().get().strip():
+                    LogBuffer.error().write(
+                        "刮削流程未返回影片数据，且上游没有提供具体错误；请检查日志中的文件识别及来源审计记录。"
+                    )
                 show_data.show_name = (
                     str(Flags.count_claw)
                     + "-"
@@ -558,6 +566,9 @@ class Scraper:
         # 检查文件大小
         result = await check_file(file_path, file_escape_size)
         if not result:
+            LogBuffer.error().write(
+                f"文件检查未通过：文件不存在、不可读取或小于配置的最小文件大小（{file_escape_size} MB）：{file_path}"
+            )
             # res.outline = split_path(file_path)[1]
             # res.tag = file_path
             return None, None
@@ -586,6 +597,7 @@ class Scraper:
                     file_can_download = False
             else:
                 if "no_nfo_scrape" not in read_mode:  # 无 nfo 且未勾选 「无nfo时，刮削并执行更新模式」
+                    LogBuffer.error().write("读取模式未找到 NFO，且未启用「无 NFO 时刮削」选项。")
                     return None, None
 
         # 判断是否write_nfo
@@ -851,8 +863,13 @@ class Scraper:
             if single_folder_catched:
                 await copy_trailer_to_theme_videos(folder_new_path, naming_rule)
 
+        # 先确认主视频已进入目标位置，再生成 NFO 和迁移字幕等副文件，避免
+        # 主视频移动失败时把这些关联文件单独留在成功目录。
+        if not await move_movie(other, file_info, file_path, file_new_path):
+            return None, None
+
         # 生成nfo文件
-        await write_nfo(file_info, res, nfo_new_path, folder_new_path, update_nfo)
+        nfo_written = await write_nfo(file_info, res, nfo_new_path, folder_new_path, update_nfo)
 
         # 移动字幕、种子、bif、trailer、其他文件
         if file_info.has_sub:
@@ -861,10 +878,6 @@ class Scraper:
         await move_bif(folder_old_path, folder_new_path, file_name, naming_rule)
         # self.move_trailer_video(folder_old_path, folder_new_path, file_name, naming_rule)
         await move_other_file(res.number, folder_old_path, folder_new_path, file_name, naming_rule)
-
-        # 移动文件
-        if not await move_movie(other, file_info, file_path, file_new_path):
-            return None, None
         await save_success_list(file_path, file_new_path)  # 保存成功列表
 
         # 创建软链接及复制文件
@@ -887,6 +900,18 @@ class Scraper:
         if not await aiofiles.os.path.exists(thumb_final_path) and await aiofiles.os.path.exists(fanart_final_path):
             other.thumb_path = fanart_final_path
 
+        if nfo_written and update_nfo and file_classification.scraping_type == FixedScrapingType.OUMEI:
+            try:
+                added_entities = remember_entities(
+                    sites=[res.series],
+                    studios=[res.studio, res.publisher],
+                    performers=res.all_actors or res.actors,
+                )
+                if added_entities:
+                    LogBuffer.log().write(f"\n 📚 已将 {added_entities} 个演员/厂商名称加入 ThePornDB 词典")
+            except Exception as e:
+                LogBuffer.error().write(f"更新 ThePornDB 演员/厂商词典失败: {e}")
+
         return res, other
 
     def _check_stop(self, show_name: str) -> None:
@@ -907,11 +932,12 @@ class Scraper:
         signal.logs_failed_show.emit(info_str)
 
 
-def start_new_scrape(file_mode: FileMode, movie_list: list[Path] | None = None) -> None:
+def start_new_scrape(file_mode: FileMode, movie_list: list[Path] | None = None):
     Flags.stop_requested = False
     signal.stop = False
     signal.change_buttons_status.emit()
     signal.exec_set_processbar.emit(0)
+    started_signal_sent = False
     try:
         Flags.start_time = time.time()
         with manager.acquire_computed() as computed:
@@ -919,10 +945,16 @@ def start_new_scrape(file_mode: FileMode, movie_list: list[Path] | None = None) 
                 manager.config, computed.async_client, config_getter=lambda: manager.config
             )
         scraper = Scraper(crawler_provider)
-        executor.submit(scraper.run(file_mode, movie_list))
+        signal.scrape_started.emit()
+        started_signal_sent = True
+        future = executor.submit(scraper.run(file_mode, movie_list))
+        return future
     except Exception:
+        if started_signal_sent:
+            signal.scrape_finished.emit()
         signal.show_traceback_log(traceback.format_exc())
         signal.show_log_text(traceback.format_exc())
+        return None
 
 
 def get_remain_list() -> bool:

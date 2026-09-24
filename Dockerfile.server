@@ -1,0 +1,54 @@
+# syntax=docker/dockerfile:1.7
+
+FROM python:3.13-slim AS build
+
+ENV UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_CACHE_DIR=/root/.cache/uv
+
+WORKDIR /src
+
+RUN python -m pip install --no-cache-dir uv
+
+COPY pyproject.toml uv.lock ./
+COPY main.py README.md ./
+COPY ruff.toml ./
+COPY mdcx ./mdcx
+COPY resources ./resources
+COPY libs ./libs
+COPY scripts ./scripts
+COPY tests ./tests
+
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    uv sync --locked --group dev --no-install-project
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends binutils libglib2.0-0t64 \
+    && rm -rf /var/lib/apt/lists/* \
+    && uv run --no-sync ruff check \
+        mdcx/core/file_crawler.py \
+        mdcx/core/scraper.py \
+        mdcx/crawlers/javbus.py \
+        mdcx/crawlers/theporndb.py \
+        mdcx/crawlers/theporndb_match.py \
+        tests/test_file_crawler_runtime.py \
+        tests/crawlers/test_theporndb.py \
+        tests/crawlers/test_theporndb_match.py \
+        tests/crawlers/test_theporndb_audit.py \
+        tests/crawlers/test_javbus.py \
+        tests/crawlers/test_javbus_new.py \
+    && uv run --no-sync pytest -q \
+        tests/crawlers/test_theporndb_match.py \
+        tests/crawlers/test_theporndb.py \
+        tests/crawlers/test_theporndb_audit.py \
+        tests/crawlers/test_javbus.py \
+        tests/crawlers/test_javbus_new.py \
+    && uv run --no-sync python -m PyInstaller --version \
+    && uv run --no-sync python scripts/build.py --no-color
+
+FROM stainless403/mdcx-builtin-gui-base:mdcx-tpdb-capture-220260923
+
+COPY --from=build /src/dist/MDCx /app/MDCx
+RUN chmod 0755 /app/MDCx
+
+ENV APP_VERSION=220260924-review-fixes

@@ -127,7 +127,7 @@ async def get_real_url(client, ctx: Context, number, url_type, javbus_url, heade
         url_search = javbus_url + "/uncensored/search/" + number + "&type=0&parent=uc"
 
     ctx.debug(f"搜索地址: {url_search}")
-    ctx.debug_info.search_urls.append(url_search)
+    ctx.debug_info.search_urls = [*(ctx.debug_info.search_urls or []), url_search]
     html_search, error = await client.get_text(url_search, headers=headers)
     if html_search is None:
         raise CralwerException(f"网络请求错误: {error}")
@@ -136,13 +136,22 @@ async def get_real_url(client, ctx: Context, number, url_type, javbus_url, heade
 
     html = etree.fromstring(html_search, etree.HTMLParser())
     url_list = html.xpath("//a[@class='movie-box']/@href")
-    for each in url_list:
+    number_1 = "/" + number.upper().replace(".", "").replace("-", "")
+    number_2 = number_1 + "_"
+    examples = []
+    ctx.debug(f"搜索结果候选数: {len(url_list)}; 番号比较规则: path endswith {number_1} or contains {number_2}")
+    for index, each in enumerate(url_list, start=1):
         each_url = each.upper().replace("-", "")
-        number_1 = "/" + number.upper().replace(".", "").replace("-", "")
-        number_2 = number_1 + "_"
-        if each_url.endswith(number_1) or number_2 in each_url:
+        is_match = each_url.endswith(number_1) or number_2 in each_url
+        if is_match:
             ctx.debug(f"番号地址: {each}")
             return each
+        if len(examples) < 8:
+            examples.append(f"[{index}] {each} -> {each_url}")
+    ctx.debug(
+        f"搜索候选比较完成: checked={len(url_list)}, matched=0, "
+        f"前{len(examples)}个候选: {' | '.join(examples) or '-'}"
+    )
     raise CralwerException("搜索结果: 未匹配到番号！")
 
 

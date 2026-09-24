@@ -20,13 +20,19 @@ from mdcx.models.types import CrawlerDebugInfo, CrawlerInput, CrawlerResponse, C
 
 
 class _FakeCrawler:
-    def __init__(self, data: CrawlerResult | None, error: Exception | None = None):
+    def __init__(
+        self,
+        data: CrawlerResult | None,
+        error: Exception | None = None,
+        debug_logs: list[str] | None = None,
+    ):
         self._data = data
         self._error = error
+        self._debug_logs = debug_logs or []
 
     async def run(self, task_input: CrawlerInput) -> CrawlerResponse:
         return CrawlerResponse(
-            debug_info=CrawlerDebugInfo(execution_time=0.01, error=self._error),
+            debug_info=CrawlerDebugInfo(execution_time=0.01, error=self._error, logs=self._debug_logs),
             data=self._data,
         )
 
@@ -283,6 +289,49 @@ def test_classify_scrape_task_marks_youma_specific_crawlers(number: str, file_pa
 
     assert classification.scraping_type == FixedScrapingType.YOUMA
     assert classification.website == expected_website
+
+
+def test_classify_scrape_task_uses_western_dictionary_for_oumei_fallback(monkeypatch):
+    from mdcx.crawlers.theporndb_knowledge import KnownEntities
+
+    monkeypatch.setattr(
+        "mdcx.core.file_crawler.load_known_entities",
+        lambda: KnownEntities(sites=("BlackedRaw",), performers=("Evelyn Claire",)),
+    )
+    task = CrawlTask.empty()
+    task.number = "BlackedRaw-Evelyn Claire"
+    task.file_path = Path("/library/BlackedRaw-Evelyn Claire.mp4")
+    task.mosaic = "无码"
+
+    classification = classify_scrape_task(task, _ClassificationConfig())
+
+    assert classification.scraping_type == FixedScrapingType.OUMEI
+    assert classification.sites == _ClassificationConfig.website_oumei
+    assert "site=BlackedRaw" in classification.reason
+    assert "performer=Evelyn Claire" in classification.reason
+
+    LogBuffer.log().clear()
+    FileScraper._write_route_audit(task, classification)
+    assert "刮削路由审计" in LogBuffer.log().get()
+    assert "自动规则未先识别欧美" in LogBuffer.log().get()
+    LogBuffer.clear_task()
+
+
+def test_classify_scrape_task_does_not_use_parent_folder_for_western_fallback(monkeypatch):
+    from mdcx.crawlers.theporndb_knowledge import KnownEntities
+
+    monkeypatch.setattr(
+        "mdcx.core.file_crawler.load_known_entities",
+        lambda: KnownEntities(performers=("Evelyn Claire",)),
+    )
+    task = CrawlTask.empty()
+    task.number = "Scene"
+    task.file_path = Path("/library/Evelyn Claire/Scene.mp4")
+
+    classification = classify_scrape_task(task, _ClassificationConfig())
+
+    assert classification.scraping_type == FixedScrapingType.YOUMA
+    assert classification.sites == _ClassificationConfig.website_youma
 
 
 def test_classify_existing_scrape_result_uses_nfo_mosaic_without_substring_wuma_match():
@@ -639,3 +688,65 @@ async def test_call_specific_crawler_writes_debug_error_to_log_buffer():
     assert result is None
     assert "请添加 API Token 后刮削！" in LogBuffer.error().get()
     LogBuffer.error().clear()
+
+
+@pytest.mark.asyncio
+async def test_all_crawler_failures_preserve_theporndb_audit_in_saved_log(monkeypatch: pytest.MonkeyPatch):
+    class _ThePornDBOnlyConfig:
+        scrape_like = "info"
+        field_priority_try_all_images = False
+
+        def get_field_config(self, field: CrawlerResultFields) -> FieldConfig:
+            return FieldConfig(site_prority=[Website.THEPORNDB])
+
+    monkeypatch.setattr(ManualConfig, "REDUCED_FIELDS", (CrawlerResultFields.TITLE,))
+    LogBuffer.error().clear()
+    LogBuffer.log().clear()
+    provider = _FakeCrawlerProvider({})
+    provider._website_crawlers[Website.THEPORNDB] = _FakeCrawler(
+        None,
+        RuntimeError("未找到唯一匹配的内容"),
+        ["文件名解析: site=blackedraw, name=Evelyn Claire", "词典兜底筛选统计: 候选=3, 符合条件=0"],
+    )
+    scraper = FileScraper(_ThePornDBOnlyConfig(), provider)
+
+    result = await scraper._call_crawlers(CrawlerInput.empty(), [Website.THEPORNDB])
+
+    assert result is None
+    error_log = LogBuffer.error().get()
+    audit_log = LogBuffer.log().get()
+    assert "所有配置来源均未返回影片数据" in error_log
+    assert "未找到唯一匹配的内容" in error_log
+    assert "ThePornDB 匹配审计" in audit_log
+    assert "site=blackedraw" in audit_log
+    assert "候选=3, 符合条件=0" in audit_log
+    LogBuffer.clear_task()
+
+
+@pytest.mark.asyncio
+async def test_theporndb_audit_is_saved_for_success_and_redacts_secrets():
+    LogBuffer.log().clear()
+    provider = _FakeCrawlerProvider({})
+    provider._website_crawlers[Website.THEPORNDB] = _FakeCrawler(
+        _build_result(Website.THEPORNDB),
+        debug_logs=[
+            "Hash 查询未命中，继续文件名搜索",
+            "请求地址: https://api.theporndb.net/scenes?token=secret-value&q=Evelyn",
+            "Authorization: Bearer top-secret",
+        ],
+    )
+    task_input = CrawlerInput.empty()
+    task_input.file_path = Path("/pass/BlackedRaw-Evelyn Claire.mp4")
+    task_input.number = "BlackedRaw-Evelyn Claire"
+
+    response = await FileScraper(_FakeConfig(), provider)._call_crawler(task_input, Website.THEPORNDB)
+
+    audit_log = LogBuffer.log().get()
+    assert response.data is not None
+    assert "status=成功" in audit_log
+    assert "Hash 查询未命中" in audit_log
+    assert "api.theporndb.net/scenes?token=[redacted]&q=Evelyn" in audit_log
+    assert "Bearer [redacted]" in audit_log
+    assert "secret-value" not in audit_log
+    assert "top-secret" not in audit_log
+    LogBuffer.clear_task()

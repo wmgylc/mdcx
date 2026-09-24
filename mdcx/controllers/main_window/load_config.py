@@ -28,7 +28,7 @@ from mdcx.config.enums import (
 from mdcx.config.extend import get_movie_path_setting
 from mdcx.config.manager import manager
 from mdcx.config.resources import resources
-from mdcx.consts import GITHUB_ISSUES_URL, IS_WINDOWS
+from mdcx.consts import CONTROL_ONLY, GITHUB_ISSUES_URL, IS_WINDOWS
 from mdcx.gen.field_enums import CrawlerResultFields
 from mdcx.models.flags import Flags
 from mdcx.signals import signal_qt
@@ -997,7 +997,7 @@ def load_config(self: "MyMAinWindow"):
         )
 
         # 定时刮削设置
-        if Switch.TIMED_SCRAPE in switch_on:
+        if Switch.TIMED_SCRAPE in switch_on and not CONTROL_ONLY:
             self.Ui.checkBox_timed_scrape.setChecked(True)
             self.timer_scrape.start(int(timed_interval_convert))
         else:

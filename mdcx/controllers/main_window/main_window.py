@@ -47,7 +47,7 @@ from mdcx.config.enums import NfoInclude, Switch, Website
 from mdcx.config.extend import deal_url, get_movie_path_setting, parse_media_paths
 from mdcx.config.manager import manager
 from mdcx.config.resources import resources
-from mdcx.consts import GITHUB_ISSUES_URL, GITHUB_RELEASES_URL, IS_WINDOWS, LOCAL_VERSION
+from mdcx.consts import CONTROL_ONLY, GITHUB_ISSUES_URL, GITHUB_RELEASES_URL, IS_WINDOWS, LOCAL_VERSION
 from mdcx.core.naming import NameRenderOptions, NamingTarget, render_name
 from mdcx.core.network_check import run_network_check
 from mdcx.core.nfo import write_nfo
@@ -1013,6 +1013,16 @@ class MyMAinWindow(QMainWindow):
             reply = box.exec()
             if reply != QMessageBox.StandardButton.Yes:
                 return
+        self._stop_scrape_now()
+
+    def stop_scrape_from_control(self) -> bool:
+        """Stop a scrape requested by the in-process control API without a dialog."""
+        if self.Ui.pushButton_start_cap.text() != "■ 停止":
+            return False
+        self._stop_scrape_now()
+        return True
+
+    def _stop_scrape_now(self) -> None:
         if self.Ui.pushButton_start_cap.text() == "■ 停止":
             Flags.stop_requested = True
             signal_qt.stop = True
@@ -1029,6 +1039,15 @@ class MyMAinWindow(QMainWindow):
                 return
             t = threading.Thread(target=self._kill_threads)  # 关闭线程池
             t.start()
+
+    def is_scrape_running(self) -> bool:
+        return self.Ui.pushButton_start_cap.text() in {"■ 停止", " ■ 停止中 "}
+
+    def start_scrape_from_control(self):
+        """Start the same default directory scrape used by the GUI start action."""
+        if self.is_scrape_running():
+            return None
+        return start_new_scrape(FileMode.Default)
 
     # 显示停止信息
     def _show_stop_info(self):
@@ -3337,7 +3356,7 @@ class MyMAinWindow(QMainWindow):
             start_new_scrape(FileMode.Default)
 
     def auto_start(self):
-        if Switch.AUTO_START in manager.config.switch_on:
+        if not CONTROL_ONLY and Switch.AUTO_START in manager.config.switch_on:
             signal_qt.show_log_text("\n\n 🍔 已启用「软件启动后自动刮削」！即将开始自动刮削！")
             self.pushButton_start_scrape_clicked()
 

@@ -6,6 +6,41 @@ from .enums import DownloadableFile, HDPicSource, Website
 CURRENT_CONFIG_VERSION = 2
 
 
+# 旧版 INI 支持直接书写字段名（例如 ``actor/year/number-release``），
+# 以及 ``#actor/[number] originaltitle`` 这种带装饰符的写法。新版渲染器
+# 只接受 Jinja2，因此迁移时需要把这些字段转换为模板表达式。
+_LEGACY_NAMING_FIELDS = (
+    "originaltitle",
+    "first_actor",
+    "all_actor",
+    "first_letter",
+    "filename",
+    "definition",
+    "publisher",
+    "director",
+    "release",
+    "runtime",
+    "mosaic",
+    "series",
+    "studio",
+    "letters",
+    "number",
+    "title",
+    "actor",
+    "outline",
+    "year",
+    "cnword",
+    "moword",
+    "wanted",
+    "score",
+    "four_k",
+)
+_LEGACY_NAMING_FIELD_RE = re.compile(
+    rf"(?<![A-Za-z0-9_])(?P<prefix>#?)(?P<field>{'|'.join(map(re.escape, _LEGACY_NAMING_FIELDS))})(?![A-Za-z0-9_])"
+)
+_JINJA_BLOCK_RE = re.compile(r"(\{\{.*?\}\}|\{%.*?%\})")
+
+
 def _str_to_list(v: str | list[Any] | None, sep: str = ",", unique: bool = True) -> list[str]:
     if v is None:
         return []
@@ -112,7 +147,13 @@ def _migrate_builtin_naming_templates(data: dict[str, Any]) -> None:
             content = replace_field(template[colon + 1 : end])
             optional = f"{{% if {field} %}}{content}{{% endif %}}"
             template = template[:start] + optional + template[end + 1 :]
-        return replace_field(template)
+        template = replace_field(template)
+        parts = _JINJA_BLOCK_RE.split(template)
+        for index in range(0, len(parts), 2):
+            parts[index] = _LEGACY_NAMING_FIELD_RE.sub(
+                lambda match: f"{match.group('prefix')}{{{{ {match.group('field')} }}}}", parts[index]
+            )
+        return "".join(parts)
 
     for key in (
         "folder_name",
