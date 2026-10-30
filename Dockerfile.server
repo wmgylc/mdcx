@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
+ARG MDCX_RUNTIME_IMAGE=stainless403/mdcx-builtin-gui-base:mdcx-tpdb-capture-220260923
+
 FROM python:3.13-slim AS build
 
 ENV UV_LINK_MODE=copy \
@@ -62,7 +64,6 @@ RUN apt-get update \
     && uv run --no-sync python -m PyInstaller --version \
     && uv run --no-sync python scripts/build.py --no-color
 
-ARG MDCX_RUNTIME_IMAGE=stainless403/mdcx-builtin-gui-base:mdcx-tpdb-capture-220260923
 FROM ${MDCX_RUNTIME_IMAGE}
 
 COPY --from=build /src/dist/MDCx /app/MDCx
