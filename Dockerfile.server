@@ -26,23 +26,39 @@ RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends binutils libglib2.0-0t64 \
     && rm -rf /var/lib/apt/lists/* \
     && uv run --no-sync ruff check \
+        mdcx/config/extend.py \
         mdcx/core/file_crawler.py \
         mdcx/core/scraper.py \
+        mdcx/utils/file.py \
+        mdcx/utils/video.py \
+        mdcx/crawlers/javdb_new.py \
+        mdcx/crawlers/theporndb_knowledge.py \
         mdcx/crawlers/javbus.py \
         mdcx/crawlers/theporndb.py \
         mdcx/crawlers/theporndb_match.py \
         tests/test_file_crawler_runtime.py \
+        tests/test_file_utils_atomic.py \
+        tests/test_media_paths.py \
         tests/crawlers/test_theporndb.py \
         tests/crawlers/test_theporndb_match.py \
         tests/crawlers/test_theporndb_audit.py \
+        tests/crawlers/test_scrape_result_routing.py \
+        tests/crawlers/test_javdb_new.py \
         tests/crawlers/test_javbus.py \
         tests/crawlers/test_javbus_new.py \
+        tests/test_scraper_shared_number.py \
     && uv run --no-sync pytest -q \
+        tests/test_file_crawler_runtime.py \
+        tests/test_file_utils_atomic.py \
+        tests/test_media_paths.py \
         tests/crawlers/test_theporndb_match.py \
         tests/crawlers/test_theporndb.py \
         tests/crawlers/test_theporndb_audit.py \
+        tests/crawlers/test_scrape_result_routing.py \
+        tests/crawlers/test_javdb_new.py \
         tests/crawlers/test_javbus.py \
         tests/crawlers/test_javbus_new.py \
+        tests/test_scraper_shared_number.py \
     && uv run --no-sync python -m PyInstaller --version \
     && uv run --no-sync python scripts/build.py --no-color
 

@@ -14,6 +14,7 @@ from typing import Any
 from rapidfuzz import process, utils
 
 from ..number import long_name
+from ..utils.video import get_video_duration_seconds, parse_duration_seconds
 from .theporndb_knowledge import KnownEntities, compact_name
 
 MATCH_THRESHOLD = 94.9
@@ -86,18 +87,28 @@ def parse_tpdb_filename(file_path: str) -> ParsedTPDBFilename:
 
     basename = str(file_path).replace("\\", "/").rsplit("/", 1)[-1]
     stem = basename.rsplit(".", 1)[0] if "." in basename else basename
+    return _parse_tpdb_name(stem)
+
+
+def parse_tpdb_folder_name(folder_name: str) -> ParsedTPDBFilename:
+    """Parse site/date/name hints from one folder name without treating its suffix as an extension."""
+
+    basename = str(folder_name).replace("\\", "/").rsplit("/", 1)[-1]
+    return _parse_tpdb_name(basename)
+
+
+def _parse_tpdb_name(stem: str) -> ParsedTPDBFilename:
     date_match, release_dates = _find_filename_date(stem)
 
     if date_match:
         site_text = stem[: date_match.start()].strip(" ._-\t")
         name_text = stem[date_match.end() :].lstrip(" ._-\t")
     else:
-        # Match Namer's optional-date convention: the first token is the site,
-        # while the remaining basename is only a search hint. Without a date,
-        # the strict candidate validator will not auto-accept a result.
-        parts = re.split(r"[\s._-]+", stem, maxsplit=1)
-        site_text = parts[0] if parts else ""
-        name_text = parts[1] if len(parts) > 1 else ""
+        # Without a date boundary, token position alone cannot establish a site.
+        # Keep the complete basename as the search/title hint; learned entities
+        # are matched separately and may provide trustworthy vendor hints.
+        site_text = ""
+        name_text = stem
 
     site = _canonical_site(site_text)
     name = _clean_name(name_text)
@@ -411,17 +422,44 @@ def explain_filename_candidates(
     return matches, counts, examples
 
 
+def explain_full_filename_title_candidates(
+    filename: str | Path,
+    candidates: Iterable[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, int], list[str]]:
+    """Compare the entire cleaned video basename with candidate title/performer combinations."""
+    basename = Path(str(filename).replace("\\", "/")).name
+    stem = basename.rsplit(".", 1)[0] if "." in basename else basename
+    query = _clean_name(stem)
+    candidate_list = [candidate for candidate in candidates if isinstance(candidate, dict)]
+    counts = {"candidates": len(candidate_list), "matched": 0, "name_mismatch": 0}
+    matches: list[dict[str, Any]] = []
+    examples: list[str] = []
+    examples_by_decision: dict[str, int] = {}
+
+    for candidate in candidate_list:
+        title = _clean_name(str(candidate.get("title") or ""))
+        performers = _performer_names(candidate)
+        score = _best_name_score(query, _name_choices(title, performers))
+        if score >= MATCH_THRESHOLD:
+            decision = "接受-full-title"
+            counts["matched"] += 1
+            matches.append(candidate)
+        else:
+            decision = "拒绝-full-title"
+            counts["name_mismatch"] += 1
+
+        if examples_by_decision.get(decision, 0) < 4:
+            examples_by_decision[decision] = examples_by_decision.get(decision, 0) + 1
+            examples.append(
+                f"{candidate_audit_summary(candidate, decision)}; "
+                f"filename_title={query or '-'}, name_score={score:.1f}/{MATCH_THRESHOLD:.1f}"
+            )
+
+    return matches, counts, examples
+
+
 def _duration_seconds(value: Any) -> float | None:
-    try:
-        if isinstance(value, str) and ":" in value:
-            seconds = 0.0
-            for part in value.split(":"):
-                seconds = seconds * 60 + float(part)
-            return seconds if seconds > 0 else None
-        seconds = float(value)
-        return seconds if seconds > 0 else None
-    except (TypeError, ValueError):
-        return None
+    return parse_duration_seconds(value, bare_unit="seconds")
 
 
 def duration_tolerance_seconds(left: float, right: float) -> float:
@@ -490,21 +528,8 @@ def explain_duration_candidates(
     return selected, counts, examples
 
 
-def get_media_duration_seconds(file_path: str | Path) -> float | None:
-    """Read local media duration through PyAV; duration is optional for matching."""
-
-    try:
-        import av
-
-        with av.open(str(file_path)) as container:
-            if container.duration:
-                return float(container.duration) / 1_000_000
-            for stream in container.streams.video:
-                if stream.duration and stream.time_base:
-                    return float(stream.duration * stream.time_base)
-    except Exception:
-        return None
-    return None
+# Compatibility alias; keep one PyAV duration reader for the project.
+get_media_duration_seconds = get_video_duration_seconds
 
 
 def explain_known_entity_candidates(

@@ -10,12 +10,16 @@ import threading
 import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 _LOCK = threading.RLock()
 _LOGGER = logging.getLogger(__name__)
 _FILENAME = "theporndb_entities.json"
 _CATEGORIES = ("sites", "studios", "performers")
+_CACHE_PATH: Path | None = None
+_CACHE_SIGNATURE: tuple[int, int, int] | None = None
+_CACHE_ENTITIES: KnownEntities | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,15 +78,40 @@ def _read(path: Path) -> dict[str, list[str]]:
     return values
 
 
+def _file_signature(path: Path) -> tuple[int, int, int] | None:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    return stat.st_mtime_ns, stat.st_size, stat.st_ino
+
+
+def _cache_entities(path: Path, values: dict[str, list[str]]) -> KnownEntities:
+    global _CACHE_PATH, _CACHE_SIGNATURE, _CACHE_ENTITIES
+    entities = KnownEntities(**{key: tuple(value) for key, value in values.items()})
+    _CACHE_PATH = path
+    _CACHE_SIGNATURE = _file_signature(path)
+    _CACHE_ENTITIES = entities
+    return entities
+
+
 def load_known_entities(data_folder: Path | None = None) -> KnownEntities:
-    path = _dictionary_path(data_folder)
+    path = _dictionary_path(data_folder).resolve()
+    global _CACHE_PATH, _CACHE_SIGNATURE, _CACHE_ENTITIES
     with _LOCK:
+        signature = _file_signature(path)
+        if path == _CACHE_PATH and signature == _CACHE_SIGNATURE and _CACHE_ENTITIES is not None:
+            return _CACHE_ENTITIES
         try:
             values = _read(path)
         except (OSError, ValueError) as error:
             _LOGGER.warning("读取 ThePornDB 演员/厂商词典失败，将按空词典继续匹配: %s", error)
             values = {category: [] for category in _CATEGORIES}
-    return KnownEntities(**{key: tuple(value) for key, value in values.items()})
+            _CACHE_PATH = None
+            _CACHE_SIGNATURE = None
+            _CACHE_ENTITIES = None
+            return KnownEntities()
+        return _cache_entities(path, values)
 
 
 def remember_entities(
@@ -122,6 +151,7 @@ def remember_entities(
                 os.replace(temporary_path, path)
             finally:
                 temporary_path.unlink(missing_ok=True)
+            _cache_entities(path.resolve(), values)
     return added
 
 
@@ -138,16 +168,22 @@ def _entity_pattern(name: str) -> re.Pattern[str] | None:
     return re.compile(pattern, re.UNICODE)
 
 
-def _find_names_in_basename(values: Iterable[str], basename: str) -> tuple[str, ...]:
-    matches: list[tuple[int, int, int, str]] = []
+@lru_cache(maxsize=8)
+def _compiled_entity_patterns(values: tuple[str, ...]) -> tuple[tuple[int, str, re.Pattern[str]], ...]:
     ordered = sorted(values, key=lambda value: len(compact_name(value)), reverse=True)
-    folded_basename = _fold_for_match(basename)
+    compiled = []
     for priority, name in enumerate(ordered):
         if len(compact_name(name)) < 5:
             continue
-        pattern = _entity_pattern(name)
-        if pattern is None:
-            continue
+        if pattern := _entity_pattern(name):
+            compiled.append((priority, name, pattern))
+    return tuple(compiled)
+
+
+def _find_names_in_basename(values: Iterable[str], basename: str) -> tuple[str, ...]:
+    matches: list[tuple[int, int, int, str]] = []
+    folded_basename = _fold_for_match(basename)
+    for priority, name, pattern in _compiled_entity_patterns(tuple(values)):
         matches.extend(
             (match.start(), match.end(), priority, name)
             for match in pattern.finditer(folded_basename)
@@ -173,8 +209,14 @@ def find_known_entities(file_path: str | Path, entities: KnownEntities) -> Known
 
     basename = str(file_path).replace("\\", "/").rsplit("/", 1)[-1]
     stem = basename.rsplit(".", 1)[0] if "." in basename else basename
+    return find_known_entities_in_name(stem, entities)
+
+
+def find_known_entities_in_name(name: str, entities: KnownEntities) -> KnownEntities:
+    """Match learned names in one explicitly selected filename or folder name."""
+
     return KnownEntities(
-        sites=_find_names_in_basename(entities.sites, stem),
-        studios=_find_names_in_basename(entities.studios, stem),
-        performers=_find_names_in_basename(entities.performers, stem),
+        sites=_find_names_in_basename(entities.sites, name),
+        studios=_find_names_in_basename(entities.studios, name),
+        performers=_find_names_in_basename(entities.performers, name),
     )

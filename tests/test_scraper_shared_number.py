@@ -31,7 +31,7 @@ def _setup_scraper_test_env(monkeypatch: pytest.MonkeyPatch):
     async def fake_check_file(*_args, **_kwargs):
         return True
 
-    def fake_get_movie_path_setting(_file_path=None):
+    def fake_get_movie_path_setting(_file_path=None, **_kwargs):
         return SimpleNamespace(success_folder=Path("."), movie_path=Path("."))
 
     original_sleep = asyncio.sleep

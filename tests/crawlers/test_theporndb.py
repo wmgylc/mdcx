@@ -1,3 +1,4 @@
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import oshash
@@ -25,6 +26,37 @@ class FakeTheporndbHashHitClient:
     async def get_json(self, url, **kwargs):
         if url == "https://api.theporndb.net/scenes/hash/fakehash":
             return {"data": _api_data("hash-hit", "scenes", title="Hash Hit")}, ""
+        return None, f"unexpected url: {url}"
+
+
+class FakeTheporndbUnaFairyClient:
+    def __init__(self):
+        self.candidate = _api_data(
+            "manyvidsfanthomasger-una-fairy-on-the-edge",
+            "scenes",
+            title="Una Fairy - On The Edge",
+            date="2025-01-25",
+            site_short_name="manyvidsfanthomasger",
+            site_name="Manyvids: Fanthomas_ger",
+            duration=1545,
+            performers=[],
+        )
+        self.candidate["performers"] = []
+        self.urls = []
+
+    async def get_json(self, url, **kwargs):
+        self.urls.append(url)
+        if url == "https://api.theporndb.net/scenes/hash/fakehash":
+            return None, "HTTP 404"
+        if url == "https://api.theporndb.net/scenes/manyvidsfanthomasger-una-fairy-on-the-edge":
+            return {"data": self.candidate}, ""
+        if url.startswith("https://api.theporndb.net/scenes?"):
+            query = parse_qs(urlparse(url).query)
+            if query.get("parse") == ["Una Fairy On the Edge"]:
+                return {"data": [self.candidate]}, ""
+            return {"data": []}, ""
+        if url.startswith("https://api.theporndb.net/movies?"):
+            return {"data": []}, ""
         return None, f"unexpected url: {url}"
 
 
@@ -123,6 +155,60 @@ class FakeTheporndbEntityFallbackClient:
                 )
             }, ""
         return {"data": []}, ""
+
+
+class FakeTheporndbParentFolderFallbackClient:
+    def __init__(self):
+        self.urls = []
+        self.candidate = _api_data(
+            "nylonperv-pantyhose-princess",
+            "scenes",
+            title="Pantyhose Princess Fucked Then Pussy Creamed",
+            date="2025-10-10",
+            site_short_name="nylonperv",
+            site_name="NylonPerv",
+            duration=3368,
+            performers=[{"name": "Mia Trejsi", "parent": {"extras": {"gender": "Female"}}}],
+        )
+
+    async def get_json(self, url, **kwargs):
+        self.urls.append(url)
+        if url == "https://api.theporndb.net/scenes/hash/fakehash":
+            return None, "HTTP 404"
+        if url == "https://api.theporndb.net/scenes/nylonperv-pantyhose-princess":
+            return {"data": self.candidate}, ""
+        if url.startswith("https://api.theporndb.net/scenes?"):
+            query = parse_qs(urlparse(url).query)
+            if [site.casefold() for site in query.get("site", [])] == ["nylonperv"]:
+                return {"data": [self.candidate]}, ""
+            return {"data": []}, ""
+        return None, f"unexpected url: {url}"
+
+
+class FakeTheporndbParentFolderFilenameClient:
+    def __init__(self):
+        self.urls = []
+        self.candidate = _api_data(
+            "nylonperv-scene-title",
+            "scenes",
+            title="Scene Title",
+            date="2025-10-10",
+            site_short_name="nylonperv",
+            site_name="NylonPerv",
+            duration=3368,
+        )
+
+    async def get_json(self, url, **kwargs):
+        self.urls.append(url)
+        if url == "https://api.theporndb.net/scenes/hash/fakehash":
+            return None, "HTTP 404"
+        if url == "https://api.theporndb.net/scenes/nylonperv-scene-title":
+            return {"data": self.candidate}, ""
+        if url.startswith("https://api.theporndb.net/scenes?"):
+            if "Scene%20Title" in url:
+                return {"data": [self.candidate]}, ""
+            return {"data": []}, ""
+        return None, f"unexpected url: {url}"
 
 
 def _api_data(
@@ -266,6 +352,39 @@ async def test_theporndb_crawler_continues_search_when_hash_misses(monkeypatch: 
 
 
 @pytest.mark.asyncio
+async def test_una_fairy_title_and_exact_runtime_reach_final_theporndb_metadata(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    monkeypatch.setattr(oshash, "oshash", lambda file_path: "fakehash")
+    monkeypatch.setattr(manager, "data_folder", tmp_path)
+    monkeypatch.setattr(manager.config, "theporndb_api_token", "token")
+    monkeypatch.setattr(
+        manager.config,
+        "switch_on",
+        [switch for switch in manager.config.switch_on if switch != Switch.THEPORNDB_NO_HASH],
+    )
+    monkeypatch.setattr("mdcx.crawlers.theporndb.get_media_duration_seconds", lambda file_path: 1545.04)
+    task_input = _file_input()
+    task_input.file_path = Path("/pass/us/Una_Fairy-On_the_Edge.mp4")
+    client = FakeTheporndbUnaFairyClient()
+
+    result = await TheporndbCrawler(client=client).run(task_input)
+
+    assert result.debug_info.error is None
+    assert result.data is not None
+    assert result.data.title == "Una Fairy - On The Edge"
+    assert result.data.runtime == "25"
+    assert result.data.actors == []
+    logs = "\n".join(result.debug_info.logs)
+    assert "阶段3b 完整文件名标题兜底候选" in logs
+    assert "name_score=100.0/94.9" in logs
+    assert "runtime_delta=0.0s" in logs
+    assert "最终匹配来源: 完整文件名标题候选＋时长最终筛选" in logs
+    assert "详情请求开始: url=https://api.theporndb.net/scenes/manyvidsfanthomasger-una-fairy-on-the-edge" in logs
+    assert "https://api.theporndb.net/scenes/manyvidsfanthomasger-una-fairy-on-the-edge" in client.urls
+
+
+@pytest.mark.asyncio
 async def test_theporndb_uses_learned_entity_and_duration_fallback(monkeypatch: pytest.MonkeyPatch, tmp_path):
     monkeypatch.setattr(oshash, "oshash", lambda file_path: "fakehash")
     monkeypatch.setattr(manager, "data_folder", tmp_path)
@@ -301,6 +420,87 @@ async def test_theporndb_uses_learned_entity_and_duration_fallback(monkeypatch: 
     assert "最终匹配来源: 原有逻辑/字典日期候选＋时长最终筛选" in logs
     queries = [parse_qs(urlparse(url).query) for url in client.urls]
     assert any(query.get("site") and query.get("q") == ["Evelyn Claire"] for query in queries)
+
+
+@pytest.mark.asyncio
+async def test_theporndb_uses_parent_folder_only_after_hash_and_filename_fallbacks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    monkeypatch.setattr(oshash, "oshash", lambda file_path: "fakehash")
+    monkeypatch.setattr(manager, "data_folder", tmp_path)
+    monkeypatch.setattr(manager.config, "theporndb_api_token", "token")
+    monkeypatch.setattr(
+        manager.config,
+        "switch_on",
+        [switch for switch in manager.config.switch_on if switch != Switch.THEPORNDB_NO_HASH],
+    )
+    monkeypatch.setattr("mdcx.crawlers.theporndb.get_media_duration_seconds", lambda file_path: 3368.32)
+    from mdcx.crawlers.theporndb_knowledge import remember_entities
+
+    remember_entities(sites=["NylonPerv"], performers=["Mia Trejsi"], data_folder=tmp_path)
+    folder = (
+        "NylonPerv.25.10.10.Mia.Trejsi.Pantyhose.Princess.Fucked.Then.Pussy.Creamed."
+        "XXX.1080p.MP4-LEWD[XC]"
+    )
+    task_input = _file_input()
+    task_input.number = "LEWD-251010"
+    task_input.file_path = Path("/library") / folder / "lewd-np251010mtppftpc.mp4"
+
+    client = FakeTheporndbParentFolderFallbackClient()
+    result = await TheporndbCrawler(client=client).run(task_input)
+
+    assert result.debug_info.error is None
+    assert result.data is not None
+    assert result.data.title == "Pantyhose Princess Fucked Then Pussy Creamed"
+    logs = "\n".join(result.debug_info.logs)
+    assert "Hash 匹配未命中" in logs
+    assert "阶段1未得到唯一时长候选，进入阶段2" in logs
+    assert "阶段4 Hash/文件名匹配未得到唯一结果，直接父文件夹完整重跑名称匹配" in logs
+    assert "父文件夹词典实体识别: sites=NylonPerv" in logs
+    assert "最终匹配来源: 文件名/父文件夹词典日期候选＋时长最终筛选" in logs
+
+    hash_index = next(i for i, url in enumerate(client.urls) if "/hash/" in url)
+    filename_query_index = next(i for i, url in enumerate(client.urls) if "site=lewdnp" in url)
+    folder_query_index = next(
+        i
+        for i, url in enumerate(client.urls)
+        if [site.casefold() for site in parse_qs(urlparse(url).query).get("site", [])] == ["nylonperv"]
+    )
+    assert hash_index == 0
+    assert filename_query_index < folder_query_index
+
+
+@pytest.mark.asyncio
+async def test_theporndb_retries_filename_matching_with_parent_folder_name_before_dictionary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    monkeypatch.setattr(oshash, "oshash", lambda file_path: "fakehash")
+    monkeypatch.setattr(manager, "data_folder", tmp_path)
+    monkeypatch.setattr(manager.config, "theporndb_api_token", "token")
+    monkeypatch.setattr(
+        manager.config,
+        "switch_on",
+        [switch for switch in manager.config.switch_on if switch != Switch.THEPORNDB_NO_HASH],
+    )
+    monkeypatch.setattr("mdcx.crawlers.theporndb.get_media_duration_seconds", lambda file_path: 3368.32)
+    task_input = _file_input()
+    task_input.number = "unmatched"
+    task_input.file_path = Path("/library/NylonPerv.25.10.10.Scene Title/unmatched.mp4")
+
+    client = FakeTheporndbParentFolderFilenameClient()
+    result = await TheporndbCrawler(client=client).run(task_input)
+
+    assert result.debug_info.error is None
+    assert result.data is not None
+    assert result.data.title == "Scene Title"
+    logs = "\n".join(result.debug_info.logs)
+    assert "Hash 匹配未命中" in logs
+    assert "父文件夹查询计划" in logs
+    assert "父文件夹原有逻辑候选汇总" in logs
+    assert "父文件夹词典实体识别" not in logs
+    assert "最终匹配来源: 父文件夹原有文件名候选＋时长最终筛选" in logs
+    assert sum("/hash/" in url for url in client.urls) == 1
+    assert any("Scene%20Title" in url for url in client.urls)
 
 
 @pytest.mark.asyncio

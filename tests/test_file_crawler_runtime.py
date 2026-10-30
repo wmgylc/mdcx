@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -270,6 +271,9 @@ def test_classify_scrape_task_keeps_existing_type_branches(
     assert classification.scraping_type == expected_type
     assert classification.scraping_type_source == "auto"
     assert classification.sites == expected_sites
+    assert classification.try_parallel_channel_fallback is classification.reason.startswith(
+        "所有显式类型规则及欧美实体词典均未命中"
+    )
 
 
 @pytest.mark.parametrize(
@@ -288,7 +292,9 @@ def test_classify_scrape_task_marks_youma_specific_crawlers(number: str, file_pa
     classification = classify_scrape_task(task, _ClassificationConfig())
 
     assert classification.scraping_type == FixedScrapingType.YOUMA
+    assert classification.sites is None
     assert classification.website == expected_website
+    assert not classification.try_parallel_channel_fallback
 
 
 def test_classify_scrape_task_uses_western_dictionary_for_oumei_fallback(monkeypatch):
@@ -317,7 +323,63 @@ def test_classify_scrape_task_uses_western_dictionary_for_oumei_fallback(monkeyp
     LogBuffer.clear_task()
 
 
-def test_classify_scrape_task_does_not_use_parent_folder_for_western_fallback(monkeypatch):
+def test_classify_scrape_task_uses_direct_parent_folder_for_western_fallback(monkeypatch):
+    from mdcx.crawlers.theporndb_knowledge import KnownEntities
+
+    monkeypatch.setattr(
+        "mdcx.core.file_crawler.load_known_entities",
+        lambda: KnownEntities(sites=("NylonPerv",), performers=("Mia Trejsi",)),
+    )
+    task = CrawlTask.empty()
+    task.number = "LEWD-251010"
+    task.file_path = Path("/library/NylonPerv - Mia Trejsi/scene.mp4")
+
+    classification = classify_scrape_task(task, _ClassificationConfig())
+
+    assert classification.scraping_type == FixedScrapingType.OUMEI
+    assert classification.sites == _ClassificationConfig.website_oumei
+    assert "直接父文件夹命中欧美实体词典" in classification.reason
+    assert "site=NylonPerv" in classification.reason
+    assert "performer=Mia Trejsi" in classification.reason
+
+
+def test_classify_scrape_task_checks_parent_folder_legacy_oumei_date_pattern_before_dictionary(monkeypatch):
+    from mdcx.crawlers.theporndb_knowledge import KnownEntities
+
+    monkeypatch.setattr(
+        "mdcx.core.file_crawler.load_known_entities",
+        lambda: KnownEntities(sites=("NylonPerv",), performers=("Mia Trejsi",)),
+    )
+    task = CrawlTask.empty()
+    task.number = "LEWD-251010"
+    task.file_path = Path(
+        "/library/NylonPerv.25.10.10.Mia.Trejsi.Scene.Title.1080p/lewd-np251010mtppftpc.mp4"
+    )
+
+    classification = classify_scrape_task(task, _ClassificationConfig())
+
+    assert classification.scraping_type == FixedScrapingType.OUMEI
+    assert "直接父文件夹命中原欧美日期格式" in classification.reason
+    assert "直接父文件夹命中欧美实体词典" not in classification.reason
+
+
+def test_classify_scrape_task_keeps_explicit_file_rule_ahead_of_parent_folder(monkeypatch):
+    from mdcx.crawlers.theporndb_knowledge import KnownEntities
+
+    monkeypatch.setattr(
+        "mdcx.core.file_crawler.load_known_entities",
+        lambda: KnownEntities(performers=("Evelyn Claire",)),
+    )
+    task = CrawlTask.empty()
+    task.number = "FC2-12345"
+    task.file_path = Path("/library/Evelyn Claire/FC2-12345.mp4")
+
+    classification = classify_scrape_task(task, _ClassificationConfig())
+
+    assert classification.scraping_type == FixedScrapingType.FC2
+
+
+def test_classify_scrape_task_does_not_scan_ancestor_folders(monkeypatch):
     from mdcx.crawlers.theporndb_knowledge import KnownEntities
 
     monkeypatch.setattr(
@@ -326,12 +388,118 @@ def test_classify_scrape_task_does_not_use_parent_folder_for_western_fallback(mo
     )
     task = CrawlTask.empty()
     task.number = "Scene"
-    task.file_path = Path("/library/Evelyn Claire/Scene.mp4")
+    task.file_path = Path("/library/Evelyn Claire/collection/Scene.mp4")
 
     classification = classify_scrape_task(task, _ClassificationConfig())
 
     assert classification.scraping_type == FixedScrapingType.YOUMA
-    assert classification.sites == _ClassificationConfig.website_youma
+    assert classification.try_parallel_channel_fallback
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("japanese_hit", "expected_type", "expected_title"),
+    [
+        (True, FixedScrapingType.YOUMA, "Japanese result"),
+        (False, FixedScrapingType.OUMEI, "Western result"),
+    ],
+)
+@pytest.mark.parametrize("scrape_like", ["info", "speed"])
+async def test_default_fallback_tries_all_configured_channels_and_prefers_primary_type(
+    monkeypatch: pytest.MonkeyPatch,
+    scrape_like: str,
+    japanese_hit: bool,
+    expected_type: FixedScrapingType,
+    expected_title: str,
+):
+    config = Config(
+        website_youma=[Website.DMM],
+        website_wuma=[],
+        website_suren=[],
+        website_fc2=[],
+        website_oumei=[Website.THEPORNDB],
+        website_guochan=[Website.MDTV],
+        scrape_like=scrape_like,
+    )
+    config.show_web_log = True
+    scraper = FileScraper(config, crawler_provider=None)
+    task = CrawlTask.empty()
+    task.number = "Unclassified Scene"
+    started: set[FixedScrapingType] = set()
+    both_started = asyncio.Event()
+
+    async def fake_call_crawlers(task_input, classification):
+        assert task_input is not task
+        started.add(classification.scraping_type)
+        if len(started) == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=1)
+        if classification.scraping_type == FixedScrapingType.YOUMA:
+            await asyncio.sleep(0.01)
+            if not japanese_hit:
+                return None
+            result = CrawlersResult.empty()
+            result.title = "Japanese result"
+            result.originaltitle = result.title
+            return result
+        result = CrawlersResult.empty()
+        result.title = (
+            "Western result"
+            if classification.scraping_type == FixedScrapingType.OUMEI
+            else f"{classification.scraping_type.value.title()} result"
+        )
+        result.originaltitle = result.title
+        return result
+
+    monkeypatch.setattr(scraper, "_call_crawlers", fake_call_crawlers)
+    monkeypatch.setattr(scraper, "_call_speed_crawlers", fake_call_crawlers)
+
+    result = await scraper._crawl(task, website=None)
+
+    assert result is not None
+    assert result.scraping_type == expected_type
+    assert result.title == expected_title
+    assert started == {FixedScrapingType.YOUMA, FixedScrapingType.OUMEI, FixedScrapingType.GUOCHAN}
+    audit = LogBuffer.log().get()
+    assert "默认分类全渠道兜底" in audit
+    assert "youma -> oumei -> guochan" in audit
+    assert "全渠道最终选择：" in audit
+    LogBuffer.clear_task()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scrape_like", ["info", "speed"])
+async def test_default_fallback_skips_channel_without_a_title(monkeypatch: pytest.MonkeyPatch, scrape_like: str):
+    config = Config(
+        website_youma=[Website.DMM],
+        website_wuma=[],
+        website_suren=[],
+        website_fc2=[],
+        website_oumei=[Website.THEPORNDB],
+        website_guochan=[],
+        scrape_like=scrape_like,
+    )
+    config.show_web_log = True
+    scraper = FileScraper(config, crawler_provider=None)
+    task = CrawlTask.empty()
+    task.number = "Unclassified Scene"
+
+    async def fake_call(task_input, classification):
+        result = CrawlersResult.empty()
+        if classification.scraping_type == FixedScrapingType.OUMEI:
+            result.title = "Western result"
+        return result
+
+    monkeypatch.setattr(scraper, "_call_crawlers", fake_call)
+    monkeypatch.setattr(scraper, "_call_speed_crawlers", fake_call)
+
+    result = await scraper._crawl(task, website=None)
+
+    assert result is not None
+    assert result.scraping_type == FixedScrapingType.OUMEI
+    assert result.title == "Western result"
+    assert "缺少标题，按未匹配处理" in LogBuffer.log().get()
+    LogBuffer.clear_task()
 
 
 def test_classify_existing_scrape_result_uses_nfo_mosaic_without_substring_wuma_match():
@@ -361,6 +529,26 @@ def test_classify_scrape_task_fixed_type_overrides_auto_detection():
     assert classification.scraping_type == FixedScrapingType.SUREN
     assert classification.scraping_type_source == "fixed"
     assert classification.sites == {Website.MGSTAGE}
+
+
+@pytest.mark.parametrize(
+    ("scraping_type", "expected_subfolder"),
+    [
+        (FixedScrapingType.OUMEI, "us"),
+        (FixedScrapingType.YOUMA, "jp"),
+        (FixedScrapingType.WUMA, "jp"),
+        (FixedScrapingType.SUREN, "jp"),
+        (FixedScrapingType.FC2, "jp"),
+        (FixedScrapingType.AUTO, "jp"),
+        (FixedScrapingType.GUOCHAN, None),
+    ],
+)
+def test_scrape_classification_selects_success_output_subfolder(scraping_type, expected_subfolder):
+    from mdcx.core.file_crawler import ScrapeClassification
+
+    classification = ScrapeClassification(scraping_type, "test")
+
+    assert classification.output_subfolder == expected_subfolder
 
 
 def test_avwiki_uses_unified_scraping_types():
@@ -477,6 +665,90 @@ async def test_call_crawlers_uses_type_field_priority(monkeypatch: pytest.Monkey
     assert result is not None
     assert result.runtime == "55"
     assert result.field_sources[CrawlerResultFields.RUNTIME] == Website.JAVDB.value
+
+
+@pytest.mark.asyncio
+async def test_japanese_number_prefers_closest_runtime_across_configured_sites(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setattr(ManualConfig, "REDUCED_FIELDS", (CrawlerResultFields.RUNTIME,))
+    monkeypatch.setattr("mdcx.core.file_crawler.get_video_duration_seconds", lambda _: 59 * 60)
+
+    config = Config(fixed_scraping_type=FixedScrapingType.YOUMA, website_youma=[Website.AVBASE, Website.JAVDB])
+    config.set_type_field_sites(FixedScrapingType.YOUMA, CrawlerResultFields.RUNTIME, [Website.AVBASE, Website.JAVDB])
+    avbase = _build_result(Website.AVBASE, runtime="100")
+    avbase.number = "SCUTE-1354"
+    javdb = _build_result(Website.JAVDB, runtime="60")
+    javdb.number = "SCUTE1354"
+    provider = _FakeCrawlerProvider({Website.AVBASE: avbase, Website.JAVDB: javdb})
+
+    task_input = CrawlerInput.empty()
+    task_input.file_path = tmp_path / "SCUTE-1354.mp4"
+    task_input.number = "SCUTE-1354"
+    classification = classify_scrape_task(task_input, config)
+    result = await FileScraper(config, provider)._call_crawlers(task_input, classification)
+
+    assert result is not None
+    assert result.runtime == "60"
+    assert result.field_sources[CrawlerResultFields.RUNTIME] == Website.JAVDB.value
+
+
+@pytest.mark.asyncio
+async def test_japanese_duration_priority_requires_multiple_same_number_matches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setattr(ManualConfig, "REDUCED_FIELDS", (CrawlerResultFields.RUNTIME,))
+    monkeypatch.setattr("mdcx.core.file_crawler.get_video_duration_seconds", lambda _: 59 * 60)
+
+    config = Config(fixed_scraping_type=FixedScrapingType.YOUMA, website_youma=[Website.AVBASE, Website.JAVDB])
+    config.set_type_field_sites(FixedScrapingType.YOUMA, CrawlerResultFields.RUNTIME, [Website.AVBASE, Website.JAVDB])
+    avbase = _build_result(Website.AVBASE, runtime="100")
+    avbase.number = "SCUTE-1354"
+    javdb = _build_result(Website.JAVDB, runtime="60")
+    javdb.number = "DIFFERENT-0001"
+    provider = _FakeCrawlerProvider({Website.AVBASE: avbase, Website.JAVDB: javdb})
+
+    task_input = CrawlerInput.empty()
+    task_input.file_path = tmp_path / "SCUTE-1354.mp4"
+    task_input.number = "SCUTE-1354"
+    classification = classify_scrape_task(task_input, config)
+    result = await FileScraper(config, provider)._call_crawlers(task_input, classification)
+
+    assert result is not None
+    assert result.runtime == "100"
+    assert result.field_sources[CrawlerResultFields.RUNTIME] == Website.AVBASE.value
+
+
+@pytest.mark.asyncio
+async def test_western_channel_keeps_lazy_site_priority_with_local_duration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setattr(ManualConfig, "REDUCED_FIELDS", (CrawlerResultFields.RUNTIME,))
+    monkeypatch.setattr("mdcx.core.file_crawler.get_video_duration_seconds", lambda _: 59 * 60)
+    records: list[Website] = []
+
+    config = Config(fixed_scraping_type=FixedScrapingType.OUMEI, website_oumei=[Website.AVBASE, Website.JAVDB])
+    config.set_type_field_sites(FixedScrapingType.OUMEI, CrawlerResultFields.RUNTIME, [Website.AVBASE, Website.JAVDB])
+    avbase = _build_result(Website.AVBASE, runtime="100")
+    avbase.number = "SCUTE-1354"
+    javdb = _build_result(Website.JAVDB, runtime="60")
+    javdb.number = "SCUTE-1354"
+    provider = _ResultRecordingCrawlerProvider(
+        {
+            Website.AVBASE: _ResultRecordingCrawler(Website.AVBASE, records, avbase),
+            Website.JAVDB: _ResultRecordingCrawler(Website.JAVDB, records, javdb),
+        }
+    )
+
+    task_input = CrawlerInput.empty()
+    task_input.file_path = tmp_path / "SCUTE-1354.mp4"
+    task_input.number = "SCUTE-1354"
+    classification = classify_scrape_task(task_input, config)
+    result = await FileScraper(config, provider)._call_crawlers(task_input, classification)
+
+    assert result is not None
+    assert result.runtime == "100"
+    assert records == [Website.AVBASE]
 
 
 @pytest.mark.asyncio

@@ -59,15 +59,20 @@ def _select_movie_path(movie_paths: list[Path], file_path: Path | None) -> Path:
 
 
 def get_movie_path_setting(
-    file_path: Path | None = None, movie_path_override: str | Path | None = None
+    file_path: Path | None = None,
+    movie_path_override: str | Path | None = None,
+    success_subfolder: str | None = None,
 ) -> MoviePathSetting:
+    """Resolve media paths; a result-derived success bucket overrides source folder names."""
     movie_paths = parse_media_paths(movie_path_override)  # 用户设置的扫描媒体路径
     movie_path = _select_movie_path(movie_paths, file_path)
     end_folder_name = movie_path.name
     # 用户设置的软链接输出目录
     softlink_path = Path(manager.config.softlink_path.replace("end_folder_name", end_folder_name))
     # 用户设置的成功输出目录
-    success_folder = Path(manager.config.success_output_folder.replace("end_folder_name", end_folder_name))
+    success_folder_template = manager.config.success_output_folder.replace("end_folder_name", end_folder_name)
+    uses_first_folder_name = "first_folder_name" in success_folder_template
+    success_folder = Path(success_folder_template)
     # 用户设置的失败输出目录
     failed_folder = Path(manager.config.failed_output_folder.replace("end_folder_name", end_folder_name))
     # 用户设置的排除目录, 转换相对路径
@@ -99,8 +104,16 @@ def get_movie_path_setting(
             except ValueError:
                 first_folder_name = ()
             first_folder_name = first_folder_name[0] if first_folder_name else ""
-            success_folder = Path(success_folder.as_posix().replace("first_folder_name", first_folder_name))
+            # The scrape result's bucket (for example ``us`` or ``jp``) is authoritative;
+            # source folders can be mixed or organized for unrelated reasons.
+            success_folder_first_folder = success_subfolder or first_folder_name
+            success_folder = Path(
+                success_folder.as_posix().replace("first_folder_name", success_folder_first_folder)
+            )
             failed_folder = Path(failed_folder.as_posix().replace("first_folder_name", first_folder_name))
+
+    if success_subfolder and not uses_first_folder_name:
+        success_folder = success_folder / success_subfolder
 
     return MoviePathSetting(
         movie_path=movie_path,

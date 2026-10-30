@@ -10,7 +10,13 @@ from parsel import Selector
 from ..config.manager import manager
 from ..config.models import Website
 from ..models.types import CrawlerResult
+from ..number import is_japanese_catalog_number
+from ..utils.video import get_video_duration_seconds, parse_duration_seconds
 from .base import BaseCrawler, CralwerException, CrawlerData, DetailPageParser, extract_all_texts, extract_text
+
+
+def _runtime_seconds(value: object) -> float | None:
+    return parse_duration_seconds(value, bare_unit="minutes")
 
 
 class Parser(DetailPageParser):
@@ -218,11 +224,18 @@ class JavdbCrawler(BaseCrawler):
             if href:
                 info_list.append([href, title, meta])
 
-        # 精确匹配
+        # 精确匹配可能有多个同番号条目，保留全部供本地时长消歧。
         number = ctx.input.number
+        number_pattern = re.compile(rf"(?<![A-Z0-9]){re.escape(number)}(?![A-Z0-9])", re.IGNORECASE)
+        exact_matches = []
         for href, title, meta in info_list:
-            if number.upper() in title.upper():
-                return [self._with_locale_zh(urljoin(self.base_url, href))]
+            if number_pattern.search(title):
+                detail_url = self._with_locale_zh(urljoin(self.base_url, href))
+                if detail_url not in exact_matches:
+                    exact_matches.append(detail_url)
+        if exact_matches:
+            ctx.debug(f"番号精确匹配候选数: {len(exact_matches)}")
+            return exact_matches
 
         # 模糊匹配
         clean_number = number.upper().replace(".", "").replace("-", "").replace(" ", "")
@@ -232,6 +245,70 @@ class JavdbCrawler(BaseCrawler):
                 return [self._with_locale_zh(urljoin(self.base_url, href))]
 
         return None
+
+    @override
+    async def _detail(self, ctx, detail_urls: list[str]) -> CrawlerData | None:
+        file_path = ctx.input.file_path
+        if (
+            len(detail_urls) < 2
+            or file_path is None
+            or not is_japanese_catalog_number(ctx.input.number)
+        ):
+            return await super()._detail(ctx, detail_urls)
+
+        local_duration = await asyncio.to_thread(get_video_duration_seconds, file_path)
+        if local_duration is None:
+            ctx.debug("检测到多个番号候选，但本地时长不可用；按站点顺序选择")
+            return await super()._detail(ctx, detail_urls)
+
+        ctx.debug(f"检测到 {len(detail_urls)} 个同番号候选；开始按本地时长比较 ({local_duration:.1f}s)")
+        candidates: list[tuple[str, CrawlerData, float | None]] = []
+        for detail_url in detail_urls:
+            try:
+                html, error = await self._fetch_detail(ctx, detail_url)
+            except Exception as error:
+                ctx.debug(f"候选详情页请求异常，跳过: {detail_url}; {type(error).__name__}: {error}")
+                continue
+            if html is None:
+                ctx.debug(f"候选详情页请求失败，跳过: {detail_url}; {error}")
+                continue
+            try:
+                data = await self._parse_detail_page(ctx, Selector(text=html), detail_url)
+            except Exception as error:
+                ctx.debug(f"候选详情页解析异常，跳过: {detail_url}; {type(error).__name__}: {error}")
+                continue
+            if data is None:
+                ctx.debug(f"候选详情页解析失败，跳过: {detail_url}")
+                continue
+            duration = _runtime_seconds(data.runtime)
+            candidates.append((detail_url, data, duration))
+            if duration is None:
+                ctx.debug(f"时长候选: {detail_url}; runtime={data.runtime}; delta=未知")
+            else:
+                ctx.debug(
+                    f"时长候选: {detail_url}; runtime={data.runtime}; "
+                    f"delta={abs(local_duration - duration):.1f}s"
+                )
+
+        if not candidates:
+            return None
+
+        comparable: list[tuple[str, CrawlerData, float]] = [
+            (url, data, duration) for url, data, duration in candidates if duration is not None
+        ]
+        if not comparable:
+            ctx.debug("所有番号候选都没有可比较的时长；按站点顺序选择")
+            return candidates[0][1]
+
+        selected_url, selected_data, selected_duration = min(
+            comparable,
+            key=lambda candidate: abs(local_duration - candidate[2]),
+        )
+        ctx.debug(
+            f"按时长差选择候选: {selected_url}; "
+            f"runtime={selected_data.runtime}; delta={abs(local_duration - selected_duration):.1f}s"
+        )
+        return selected_data
 
     @override
     async def _parse_detail_page(self, ctx, html: Selector, detail_url: str) -> CrawlerData | None:

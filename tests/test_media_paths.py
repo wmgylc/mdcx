@@ -1,6 +1,7 @@
 import importlib.util
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -86,3 +87,54 @@ def test_get_movie_path_setting_ignores_unrelated_first_folder_name_file(monkeyp
 
     assert setting.success_folder == movie_path / "JAV_output"
     assert setting.failed_folder == movie_path / "failed"
+
+
+@pytest.mark.parametrize(
+    "success_output_folder",
+    ["/jav_output", "/jav_output/first_folder_name"],
+)
+@pytest.mark.parametrize(
+    ("source_folder", "success_subfolder"),
+    [("inbox", "us"), ("mixed-library", "jp")],
+)
+def test_get_movie_path_setting_routes_mixed_source_folders_by_scrape_result(
+    monkeypatch, tmp_path, success_output_folder, source_folder, success_subfolder
+):
+    from mdcx.config.extend import get_movie_path_setting
+    from mdcx.config.manager import manager
+
+    movie_root = tmp_path / "pass"
+    file_path = movie_root / source_folder / "batch-2026" / "BlackedRaw-Evelyn Claire.mp4"
+
+    monkeypatch.setattr(manager.config, "media_path", str(movie_root))
+    monkeypatch.setattr(manager.config, "softlink_path", "softlink")
+    monkeypatch.setattr(manager.config, "success_output_folder", success_output_folder)
+    monkeypatch.setattr(manager.config, "failed_output_folder", "failed/first_folder_name")
+    monkeypatch.setattr(manager.config, "extrafanart_folder", "extrafanart")
+    monkeypatch.setattr(manager.config, "folders", [])
+    monkeypatch.setattr(manager.config, "scrape_softlink_path", False)
+
+    setting = get_movie_path_setting(file_path, success_subfolder=success_subfolder)
+
+    assert setting.success_folder == Path("/jav_output") / success_subfolder
+    assert setting.failed_folder == movie_root / "failed" / source_folder
+
+
+def test_get_movie_path_setting_appends_jp_for_japanese_classification(monkeypatch, tmp_path):
+    from mdcx.config.extend import get_movie_path_setting
+    from mdcx.config.manager import manager
+
+    movie_root = tmp_path / "pass"
+    file_path = movie_root / "us" / "ABF-131.mp4"
+
+    monkeypatch.setattr(manager.config, "media_path", str(movie_root))
+    monkeypatch.setattr(manager.config, "softlink_path", "softlink")
+    monkeypatch.setattr(manager.config, "success_output_folder", "/jav_output")
+    monkeypatch.setattr(manager.config, "failed_output_folder", "failed")
+    monkeypatch.setattr(manager.config, "extrafanart_folder", "extrafanart")
+    monkeypatch.setattr(manager.config, "folders", [])
+    monkeypatch.setattr(manager.config, "scrape_softlink_path", False)
+
+    setting = get_movie_path_setting(file_path, success_subfolder="jp")
+
+    assert setting.success_folder == Path("/jav_output/jp")

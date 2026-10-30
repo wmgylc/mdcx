@@ -39,7 +39,12 @@ from ..utils.dataclass import update
 from ..utils.file import copy_file_async, move_file_async
 from ..utils.path import is_any_descendant
 from .file import creat_folder, deal_old_files, get_file_info_v2, get_output_name, move_movie
-from .file_crawler import FileScraper, classify_existing_scrape_result, classify_scrape_task
+from .file_crawler import (
+    FileScraper,
+    classify_existing_scrape_result,
+    classify_scrape_task,
+    resolve_scrape_result_classification,
+)
 from .image import add_mark
 from .media_resource import MediaResourceContext
 from .nfo import get_nfo_data, write_nfo
@@ -629,6 +634,14 @@ class Scraper:
         # 获取已刮削的json_data
         if file_classification is None:
             file_classification = classify_scrape_task(file_info.crawl_task(), manager.config)
+        if file_classification.output_subfolder:
+            success_folder = get_movie_path_setting(
+                file_path, success_subfolder=file_classification.output_subfolder
+            ).success_folder
+            LogBuffer.log().write(
+                f"\n 📁 [输出目录路由] type={file_classification.scraping_type.value} "
+                f"subfolder={file_classification.output_subfolder} path={success_folder}"
+            )
         enable_shared_json = "." not in movie_number and file_classification.scraping_type != FixedScrapingType.GUOCHAN
         if enable_shared_json:
             if movie_number not in Flags.json_get_status:
@@ -703,6 +716,23 @@ class Scraper:
             res.letters = file_info.letters
             # 3. res.mosaic 在 crawl 中被更新, 实际上完全是由 file_info 的某些字段决定的, 和初始化 file_info.mosaic 的逻辑存在重复
             file_info.mosaic = res.mosaic
+
+        # Apply the result's type to both freshly scraped data and shared-number cache hits.
+        resolved_classification = resolve_scrape_result_classification(file_classification, res)
+        if resolved_classification != file_classification:
+            old_subfolder = file_classification.output_subfolder
+            file_classification = resolved_classification
+            new_subfolder = file_classification.output_subfolder
+            if new_subfolder != old_subfolder:
+                success_folder = (
+                    get_movie_path_setting(file_path, success_subfolder=new_subfolder).success_folder
+                    if new_subfolder
+                    else paths.success_folder
+                )
+                LogBuffer.log().write(
+                    f"\n 📁 [匹配后输出目录路由] type={file_classification.scraping_type.value} "
+                    f"subfolder={new_subfolder or '-'} path={success_folder}"
+                )
 
         # 显示json_data结果或日志
         show_result(res, start_time)

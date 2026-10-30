@@ -36,6 +36,17 @@ def normalize_uncensored_digit_number(number: str) -> str:
     return ""
 
 
+def is_japanese_catalog_number(number: str) -> bool:
+    """Return whether a parsed identifier has the shape of a Japanese catalog number."""
+    normalized = (number or "").strip().upper()
+    date_suffix = r"(?:^|[^A-Z0-9])(?:\d{2}|\d{4})[-_.]\d{1,2}[-_.]\d{1,2}$"
+    if not normalized or re.search(date_suffix, normalized):
+        return False
+    if not re.fullmatch(r"[A-Z0-9]+(?:[-_.][A-Z0-9]+)*", normalized):
+        return False
+    return bool(re.search(r"\d", normalized)) and len(re.sub(r"[^A-Z0-9]", "", normalized)) >= 5
+
+
 def is_uncensored(number: str) -> bool:
     if (
         re.match(r"n\d{4}", number)

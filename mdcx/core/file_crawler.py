@@ -1,21 +1,24 @@
+import asyncio
 import re
-from dataclasses import dataclass
+from copy import copy
+from dataclasses import dataclass, replace
 from datetime import date
 from itertools import chain
 from typing import TYPE_CHECKING
 
 from ..config.enums import FixedScrapingType
-from ..config.models import Language, Website
-from ..crawlers.theporndb_knowledge import find_known_entities, load_known_entities
+from ..config.models import CONFIGURABLE_SCRAPING_TYPES, Language, Website
+from ..crawlers.theporndb_knowledge import find_known_entities, find_known_entities_in_name, load_known_entities
 from ..gen.field_enums import CrawlerResultFields
 from ..manual import ManualConfig
 from ..models.enums import FileMode
 from ..models.flags import Flags
 from ..models.log_buffer import LogBuffer
 from ..models.types import CrawlerInput, CrawlerResponse, CrawlerResult, CrawlersResult, CrawlTask
-from ..number import is_uncensored
+from ..number import is_japanese_catalog_number, is_uncensored
 from ..signals import signal
 from ..utils.dataclass import update
+from ..utils.video import get_video_duration_seconds, parse_duration_seconds
 from .mosaic import is_guochan_mosaic, is_plain_uncensored_mosaic, normalize_mosaic
 
 if TYPE_CHECKING:
@@ -63,6 +66,11 @@ def _is_suren_number(file_number: str, short_number: str) -> bool:
     return bool(short_number) or "SIRO" in file_number.upper()
 
 
+def _has_oumei_date_pattern(value: str) -> bool:
+    """Match the legacy Western release-name shape, e.g. Studio.24.01.31."""
+    return bool(re.search(r"[^.]+\.\d{2}\.\d{2}\.\d{2}", value))
+
+
 @dataclass(frozen=True)
 class ScrapeClassification:
     scraping_type: FixedScrapingType
@@ -71,6 +79,22 @@ class ScrapeClassification:
     website: Website | None = None
     mosaic: str = ""
     reason: str = ""
+    try_parallel_channel_fallback: bool = False
+
+    @property
+    def output_subfolder(self) -> str | None:
+        """Separate Japanese and Western results while leaving other types unchanged."""
+        if self.scraping_type == FixedScrapingType.OUMEI:
+            return "us"
+        if self.scraping_type in {
+            FixedScrapingType.AUTO,
+            FixedScrapingType.YOUMA,
+            FixedScrapingType.WUMA,
+            FixedScrapingType.SUREN,
+            FixedScrapingType.FC2,
+        }:
+            return "jp"
+        return None
 
 
 def classify_scrape_task(task_input: CrawlTask, config: "Config", use_fixed_type: bool = True) -> ScrapeClassification:
@@ -130,7 +154,7 @@ def classify_scrape_task(task_input: CrawlTask, config: "Config", use_fixed_type
             return ScrapeClassification(FixedScrapingType.AUTO, "auto", reason="指定站点模式下的 FC2 未识别")
         raise Exception(f"未识别的 FC2 番号: {file_number}")
 
-    if re.search(r"[^.]+\.\d{2}\.\d{2}\.\d{2}", file_number) or (
+    if _has_oumei_date_pattern(file_number) or (
         "欧美" in file_path_str and "东欧美" not in file_path_str
     ):
         return ScrapeClassification(
@@ -140,11 +164,11 @@ def classify_scrape_task(task_input: CrawlTask, config: "Config", use_fixed_type
             reason="命中欧美日期编号格式或欧美路径关键词",
         )
 
-    # 欧美特征未直接识别时，以欧美专用实体词典作为该分类的补充兜底。
-    # 只检查影片文件名；父目录不能影响分类。
+    # Check the video basename first; parent folders are only considered at the final type default.
     western_dictionary_note = "未检查欧美实体词典（缺少文件路径）"
-    if file_path:
-        matched_entities = find_known_entities(file_path, load_known_entities())
+    known_entities = load_known_entities() if file_path else None
+    if file_path and known_entities is not None:
+        matched_entities = find_known_entities(file_path, known_entities)
         if matched_entities.sites or matched_entities.studios or matched_entities.performers:
             matched_summary = (
                 f"site={','.join(matched_entities.sites) or '-'}; "
@@ -191,17 +215,72 @@ def classify_scrape_task(task_input: CrawlTask, config: "Config", use_fixed_type
             reason=f"命中有码 DMM 番号格式；{western_dictionary_note}",
         )
 
+    # Parent-folder entities are only a routing hint after all file-level rules fail.
+    parent_folder_note = "未检查欧美父文件夹词典（缺少文件路径）"
+    if file_path:
+        parent_folder = file_path.parent.name
+        if _has_oumei_date_pattern(parent_folder):
+            return ScrapeClassification(
+                FixedScrapingType.OUMEI,
+                "auto",
+                sites=config.website_oumei,
+                reason=(
+                    "文件名未命中类型规则；直接父文件夹命中原欧美日期格式"
+                    f"（{parent_folder}）"
+                ),
+            )
+
+        if known_entities is not None:
+            matched_parent_entities = find_known_entities_in_name(parent_folder, known_entities)
+            if matched_parent_entities.sites or matched_parent_entities.studios or matched_parent_entities.performers:
+                matched_summary = (
+                    f"site={','.join(matched_parent_entities.sites) or '-'}; "
+                    f"studio={','.join(matched_parent_entities.studios) or '-'}; "
+                    f"performer={','.join(matched_parent_entities.performers) or '-'}"
+                )
+                return ScrapeClassification(
+                    FixedScrapingType.OUMEI,
+                    "auto",
+                    sites=config.website_oumei,
+                    reason=(
+                        "文件名规则未能分类；直接父文件夹命中欧美实体词典"
+                        f"（{matched_summary}）"
+                    ),
+                )
+            parent_folder_note = "直接父文件夹未命中欧美实体词典"
+        else:
+            parent_folder_note = "欧美父文件夹实体词典不可用"
+
     return ScrapeClassification(
         FixedScrapingType.YOUMA,
         "auto",
         sites=config.website_youma,
-        reason=f"所有显式类型规则及欧美实体词典均未命中，采用原日本有码默认兜底；{western_dictionary_note}",
+        reason=(
+            f"所有显式类型规则及欧美实体词典均未命中，采用原日本有码默认兜底；"
+            f"{western_dictionary_note}；{parent_folder_note}"
+        ),
+        try_parallel_channel_fallback=True,
     )
 
 
 def apply_scrape_classification(result: CrawlersResult, classification: ScrapeClassification) -> None:
     result.scraping_type = classification.scraping_type
     result.scraping_type_source = classification.scraping_type_source
+
+
+def resolve_scrape_result_classification(
+    classification: ScrapeClassification, result: CrawlersResult
+) -> ScrapeClassification:
+    """Use the successful fallback channel's type for output-side processing."""
+    if not result.scraping_type_source or result.scraping_type == classification.scraping_type:
+        return classification
+    return replace(
+        classification,
+        scraping_type=result.scraping_type,
+        scraping_type_source=result.scraping_type_source,
+        reason=f"匹配结果由 {result.scraping_type.value} 类型渠道确认",
+        try_parallel_channel_fallback=False,
+    )
 
 
 def classify_existing_scrape_result(
@@ -293,6 +372,120 @@ class FileScraper:
         if re.fullmatch(r"0+(?:\.0+)?", runtime):
             return True
         return False
+
+    @staticmethod
+    def _normalized_number_key(value: object) -> str:
+        return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+    @staticmethod
+    def _runtime_to_seconds(value: object) -> float | None:
+        return parse_duration_seconds(value, bare_unit="minutes")
+
+    @staticmethod
+    def _has_match_title(result: CrawlersResult | None) -> bool:
+        """A channel without a usable title has not identified a scrape result."""
+        return bool(result and str(result.title or "").strip())
+
+    async def _preload_japanese_duration_candidates(
+        self,
+        task_input: CrawlerInput,
+        classification: ScrapeClassification,
+        type_site_set: set[Website],
+        all_res: dict[tuple[Website, Language], CrawlerResult],
+        failed: set[tuple[Website, Language]],
+        req_info: list[str],
+    ) -> list[Website]:
+        """Load configured Japanese sources and rank same-number results by local runtime."""
+        if classification.scraping_type not in {
+            FixedScrapingType.YOUMA,
+            FixedScrapingType.WUMA,
+            FixedScrapingType.SUREN,
+            FixedScrapingType.FC2,
+        }:
+            return []
+        if not task_input.file_path or not is_japanese_catalog_number(task_input.number):
+            return []
+
+        local_duration = await asyncio.to_thread(get_video_duration_seconds, task_input.file_path)
+        if local_duration is None:
+            return []
+
+        runtime_field = CrawlerResultFields.RUNTIME
+        if hasattr(self.config, "get_type_field_config"):
+            runtime_priority = self.config.get_type_field_config(classification.scraping_type, runtime_field)
+        else:
+            runtime_priority = self.config.get_field_config(runtime_field)
+        runtime_sites = [site for site in runtime_priority.site_prority if site in type_site_set]
+        if len(runtime_sites) < 2:
+            return []
+
+        runtime_language = self.config.get_field_config(runtime_field).language
+        preload_errors: list[str] = []
+        for site in runtime_sites:
+            language = runtime_language if site in MULTI_LANGUAGE_WEBSITES else Language.UNDEFINED
+            key = (site, language)
+            if key in all_res or key in failed:
+                continue
+
+            site_input = copy(task_input)
+            site_input.language = runtime_language
+            site_input.org_language = runtime_language
+            if site in MULTI_LANGUAGE_WEBSITES and language == Language.UNDEFINED:
+                site_input.language = Language.JP
+                site_input.org_language = Language.JP
+
+            try:
+                response = await self._call_crawler(site_input, site)
+                req_info.append(f"{sprint_source(*key)} ({response.debug_info.execution_time:.2f}s)")
+                if response.data is None:
+                    error_type = type(response.debug_info.error).__name__ if response.debug_info.error else "EmptyResult"
+                    failed.add(key)
+                    preload_errors.append(f"{site.value}: {error_type}")
+                    continue
+                all_res[key] = response.data
+                if site in MULTI_LANGUAGE_WEBSITES and (site, Language.UNDEFINED) not in all_res:
+                    all_res[(site, Language.UNDEFINED)] = response.data
+            except TimeoutError:
+                failed.add(key)
+                preload_errors.append(f"{site.value}: 请求超时")
+            except Exception as error:
+                failed.add(key)
+                preload_errors.append(f"{site.value}: {type(error).__name__}")
+
+        expected_numbers = {
+            key
+            for value in (task_input.number, task_input.short_number)
+            if (key := self._normalized_number_key(value))
+        }
+        candidates: list[tuple[float, int, Website, str]] = []
+        for order, site in enumerate(runtime_sites):
+            data = self._get_cached_site_result(all_res, site, runtime_language)
+            if data is None or self._normalized_number_key(data.number) not in expected_numbers:
+                continue
+            candidate_duration = self._runtime_to_seconds(data.runtime)
+            if candidate_duration is None:
+                continue
+            delta = abs(local_duration - candidate_duration)
+            candidates.append((delta, order, site, str(data.runtime)))
+
+        if len(candidates) < 2:
+            if preload_errors:
+                LogBuffer.log().write("\n  日本番号时长候选预取失败: " + " | ".join(preload_errors))
+            return []
+
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        ranked_sites = [site for _, _, site, _ in candidates]
+        audit = [
+            f"{site.value}: runtime={runtime}, delta={delta / 60:.1f}min"
+            for delta, _, site, runtime in candidates
+        ]
+        LogBuffer.log().write(
+            f"\n  ⏱ [日本番号时长消歧] local={local_duration / 60:.1f}min; "
+            f"按近到远排序: {' | '.join(audit)}"
+        )
+        if preload_errors:
+            LogBuffer.log().write("\n  日本番号其他来源未返回: " + " | ".join(preload_errors))
+        return ranked_sites
 
     @staticmethod
     def _normalize_release(value: object) -> str:
@@ -417,6 +610,10 @@ class FileScraper:
         else:
             target = ",".join(sorted(site.value for site in (classification.sites or []))) or "-"
             reason = classification.reason or "未提供分类原因"
+            if classification.try_parallel_channel_fallback:
+                channel_types = ",".join(scraping_type.value for scraping_type in CONFIGURABLE_SCRAPING_TYPES)
+                target = f"全部已配置类型渠道[{channel_types}]（并行兜底）"
+                reason += "；并行尝试所有有站点配置的刮削类型，按类型注册顺序选择首个有效结果"
         audit = (
             "\n 🔎 [刮削路由审计] "
             f"file={task_input.file_path or '-'} number={task_input.number} "
@@ -456,9 +653,13 @@ class FileScraper:
             # 原有的超时机制已由各个 HTTP 请求单独处理
             r = await c.run(task_input)
             if website == Website.THEPORNDB:
-                self._write_theporndb_audit(task_input, r, detail_log_enabled=self.config.show_web_log)
+                self._write_theporndb_audit(
+                    task_input, r, detail_log_enabled=getattr(self.config, "show_web_log", False)
+                )
             elif website == Website.JAVBUS and r.data is None:
-                self._write_javbus_failure_audit(task_input, r, detail_log_enabled=self.config.show_web_log)
+                self._write_javbus_failure_audit(
+                    task_input, r, detail_log_enabled=getattr(self.config, "show_web_log", False)
+                )
             return r
         except Exception as e:
             if website in (Website.THEPORNDB, Website.JAVBUS):
@@ -469,7 +670,7 @@ class FileScraper:
                     f"crawler-call-exception={type(e).__name__}: {self._redact_audit_text(e)}"
                 )
                 LogBuffer.log().write(audit)
-                if not self.config.show_web_log:
+                if not getattr(self.config, "show_web_log", False):
                     signal.show_log_text(audit)
             raise
         finally:
@@ -496,6 +697,15 @@ class FileScraper:
             and getattr(self.config, "field_priority_try_all_images", False)
         )
         image_fields = {CrawlerResultFields.THUMB, CrawlerResultFields.POSTER}
+        duration_ranked_sites = await self._preload_japanese_duration_candidates(
+            task_input, classification, type_site_set, all_res, failed, req_info
+        )
+        duration_site_rank = {site: index for index, site in enumerate(duration_ranked_sites)}
+        if duration_ranked_sites:
+            reduced.field_log += (
+                "\n\n    ⏱ 日本番号时长候选优先: "
+                + " -> ".join(site.value for site in duration_ranked_sites)
+            )
 
         # 按字段分别处理，每个字段按优先级尝试获取
         for field in ManualConfig.REDUCED_FIELDS:
@@ -506,6 +716,8 @@ class FileScraper:
             else:
                 type_field_config = f_config
             f_sites = [s for s in type_field_config.site_prority if s in type_site_set]
+            if duration_ranked_sites:
+                f_sites = sorted(f_sites, key=lambda site: duration_site_rank.get(site, len(duration_site_rank)))
             f_lang = f_config.language
 
             reduced.field_log += (
@@ -622,6 +834,11 @@ class FileScraper:
             poster_priority_config = self.config.get_field_config(CrawlerResultFields.POSTER)
 
         poster_priority_sites = poster_priority_config.site_prority
+        if duration_ranked_sites:
+            poster_priority_sites = sorted(
+                poster_priority_sites,
+                key=lambda site: duration_site_rank.get(site, len(duration_site_rank)),
+            )
         poster_language = self.config.get_field_config(CrawlerResultFields.POSTER).language
 
         # 需尽力收集的字段
@@ -771,6 +988,96 @@ class FileScraper:
             LogBuffer.error().write("速度优先所有来源均无结果: " + " -> ".join(failed_info))
         return None
 
+    async def _call_configured_default_fallbacks(
+        self, task_input: CrawlTask, japanese_classification: ScrapeClassification
+    ) -> tuple[CrawlersResult | None, ScrapeClassification]:
+        """Try every configured type group when automatic routing reaches its final default."""
+        get_type_sites = getattr(self.config, "get_type_sites", None)
+        ordered_types = (
+            japanese_classification.scraping_type,
+            *(
+                scraping_type
+                for scraping_type in CONFIGURABLE_SCRAPING_TYPES
+                if scraping_type != japanese_classification.scraping_type
+            ),
+        )
+        channels: list[ScrapeClassification] = []
+        seen_sites: set[Website] = set()
+        for scraping_type in ordered_types:
+            configured_sites = (
+                get_type_sites(scraping_type)
+                if get_type_sites
+                else getattr(self.config, f"website_{scraping_type.value}", None)
+            )
+            if not configured_sites:
+                continue
+            sites = [site for site in configured_sites if site not in seen_sites]
+            seen_sites.update(configured_sites)
+            if not sites:
+                continue
+            if scraping_type == japanese_classification.scraping_type:
+                channels.append(
+                    replace(
+                        japanese_classification,
+                        sites=sites,
+                        try_parallel_channel_fallback=False,
+                    )
+                )
+            else:
+                channels.append(
+                    replace(
+                        japanese_classification,
+                        scraping_type=scraping_type,
+                        sites=sites,
+                        website=None,
+                        reason=f"默认分类兜底；并行尝试 {scraping_type.value} 类型渠道",
+                        try_parallel_channel_fallback=False,
+                    )
+                )
+
+        async def run_channel(
+            classification: ScrapeClassification,
+        ) -> tuple[CrawlersResult | None, str, str, str]:
+            channel_input = copy(task_input)
+            result: CrawlersResult | None = None
+            failure = ""
+            try:
+                if self.config.scrape_like == "speed":
+                    result = await self._call_speed_crawlers(channel_input, classification)
+                else:
+                    result = await self._call_crawlers(channel_input, classification)
+            except Exception as error:
+                failure = f"{type(error).__name__}: {error}"
+            finally:
+                logs = LogBuffer.log().get()
+                errors = LogBuffer.error().get()
+                LogBuffer.clear_task()
+            return result, logs, errors, failure
+
+        channel_order = " -> ".join(channel.scraping_type.value for channel in channels) or "无已配置渠道"
+        LogBuffer.log().write(f"\n 🔀 [默认分类全渠道兜底] 并行开始，选择顺序={channel_order}")
+        outcomes = await asyncio.gather(*(run_channel(channel) for channel in channels))
+
+        for channel, outcome in zip(channels, outcomes, strict=True):
+            result, logs, errors, failure = outcome
+            has_match_title = self._has_match_title(result)
+            status = "有效匹配" if has_match_title else ("缺少标题，按未匹配处理" if result else "无结果")
+            title = f"，title={result.title}" if has_match_title else ""
+            LogBuffer.log().write(f"\n    [{channel.scraping_type.value}] {status}{title}")
+            if failure:
+                LogBuffer.log().write(f"，异常={self._redact_audit_text(failure)}")
+            if logs:
+                LogBuffer.log().write(f"\n    [{channel.scraping_type.value}渠道详细日志]\n{logs}")
+            if errors:
+                LogBuffer.error().write(f"\n    [{channel.scraping_type.value}渠道错误]\n{errors}")
+
+        for channel, outcome in zip(channels, outcomes, strict=True):
+            if self._has_match_title(outcome[0]):
+                LogBuffer.log().write(f"\n    全渠道最终选择：{channel.scraping_type.value}（按类型注册顺序首个有效结果）")
+                return outcome[0], channel
+        LogBuffer.log().write("\n    全渠道最终选择：所有已配置类型均未匹配到结果")
+        return None, japanese_classification
+
     async def _crawl(self, task_input: CrawlTask, website: Website | None) -> CrawlersResult | None:  # 从JSON返回元数据
         appoint_number = task_input.appoint_number
         destroyed = task_input.destroyed
@@ -792,6 +1099,8 @@ class FileScraper:
                 mosaic = classification.mosaic
             if classification.website:
                 res = await self._call_specific_crawler(task_input, classification.website)
+            elif classification.try_parallel_channel_fallback:
+                res, classification = await self._call_configured_default_fallbacks(task_input, classification)
             elif self.config.scrape_like == "speed":
                 res = await self._call_speed_crawlers(task_input, classification)
             else:

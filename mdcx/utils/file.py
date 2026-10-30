@@ -1,7 +1,9 @@
 import asyncio
+import errno
 import os
 import shutil
 import subprocess
+import tempfile
 import traceback
 from collections.abc import Iterable
 from pathlib import Path
@@ -56,13 +58,56 @@ def delete_file_sync(p: str | Path):
     return False, error_info
 
 
+def _copy_file_atomic_sync(old: Path, new: Path) -> None:
+    if new.exists() and new.is_dir():
+        shutil.copy(old, new)
+        return
+
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{new.name}.", suffix=".tmp", dir=new.parent)
+    os.close(fd)
+    temporary_path = Path(temporary_name)
+    try:
+        shutil.copy(old, temporary_path)
+        os.replace(temporary_path, new)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _move_file_atomic_sync(old: Path, new: Path) -> None:
+    if old.is_dir() and not old.is_symlink():
+        shutil.move(str(old), str(new))
+        return
+    if new.exists() and new.is_dir():
+        shutil.move(str(old), str(new))
+        return
+
+    try:
+        os.replace(old, new)
+        return
+    except OSError as error:
+        if error.errno != errno.EXDEV or (old.is_dir() and not old.is_symlink()):
+            raise
+
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{new.name}.", suffix=".tmp", dir=new.parent)
+    os.close(fd)
+    temporary_path = Path(temporary_name)
+    try:
+        if old.is_symlink():
+            temporary_path.unlink()
+            os.symlink(os.readlink(old), temporary_path)
+        else:
+            shutil.copy2(old, temporary_path)
+        os.replace(temporary_path, new)
+        old.unlink()
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
 def move_file_sync(old: str | Path, new: str | Path):
     old = Path(old)
     new = Path(new)
     try:
-        if str(old).lower() != str(new).lower():
-            delete_file_sync(new)
-            shutil.move(old, new)
+        _move_file_atomic_sync(old, new)
         return True, ""
     except Exception as e:
         error_info = f" 移动文件: {old}\n 目标: {new} \n 错误: {e}\n{traceback.format_exc()}\n"
@@ -79,8 +124,7 @@ def copy_file_sync(old: Path | str, new: Path | str):
             return False, f"不存在: {old}"
         elif new.exists() and old.samefile(new):
             return True, ""
-        delete_file_sync(new)
-        shutil.copy(old, new)
+        _copy_file_atomic_sync(old, new)
         return True, ""
     except Exception as e:
         error_info = f" 复制文件: {old}\n 目标: {new} \n 错误: {e}\n{traceback.format_exc()}"
@@ -231,9 +275,7 @@ async def move_file_async(old: str | Path, new: str | Path):
     old = Path(old)
     new = Path(new)
     try:
-        if str(old).lower() != str(new).lower():
-            await delete_file_async(new)
-        await asyncio.to_thread(shutil.move, str(old), str(new))
+        await asyncio.to_thread(_move_file_atomic_sync, old, new)
         return True, ""
     except Exception as e:
         error_info = f" 移动文件: {old}\n 目标: {new} \n 错误: {e}\n{traceback.format_exc()}"
@@ -249,9 +291,9 @@ async def copy_file_async(old: str | Path, new: str | Path):
     try:
         if not await aiofiles.os.path.exists(old):
             return False, f"不存在: {old}"
-        elif str(old).lower() != str(new).lower():
-            await delete_file_async(new)
-        await asyncio.to_thread(shutil.copy, old, new)
+        elif await aiofiles.os.path.exists(new) and await asyncio.to_thread(old.samefile, new):
+            return True, ""
+        await asyncio.to_thread(_copy_file_atomic_sync, old, new)
         return True, ""
     except Exception as e:
         error_info = f" 复制文件: {old}\n 目标: {new} \n 错误: {e}\n{traceback.format_exc()}"

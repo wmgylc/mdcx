@@ -3,6 +3,7 @@ import pytest
 from mdcx.crawlers.theporndb_knowledge import (
     KnownEntities,
     find_known_entities,
+    find_known_entities_in_name,
     load_known_entities,
     remember_entities,
 )
@@ -13,9 +14,11 @@ from mdcx.crawlers.theporndb_match import (
     duration_within_tolerance,
     explain_duration_candidates,
     explain_filename_candidates,
+    explain_full_filename_title_candidates,
     explain_known_entity_candidates,
     find_known_entity_candidates,
     parse_tpdb_filename,
+    parse_tpdb_folder_name,
     score_candidate,
     select_unique_candidate,
 )
@@ -67,6 +70,31 @@ def test_parser_supports_date_orders_and_keeps_both_ambiguous_interpretations():
     queries = [variant.query for variant in build_search_variants(parsed)]
     assert "blackedraw.2021-03-04.Scene Title" in queries
     assert "blackedraw.2021-04-03.Scene Title" in queries
+
+
+def test_standard_file_and_folder_names_normalize_title_separators_only():
+    filename = "BlackedRaw-2025-01-25-Una_Fairy-On_the_Edge.mp4"
+    file_parsed = parse_tpdb_filename(filename)
+    folder_parsed = parse_tpdb_folder_name(filename.removesuffix(".mp4"))
+
+    for parsed in (file_parsed, folder_parsed):
+        assert parsed.site == "blackedraw"
+        assert parsed.release_dates == ("2025-01-25",)
+        assert parsed.name == "Una Fairy On the Edge"
+
+    assert build_search_variants(file_parsed)[0].query == (
+        "blackedraw.2025-01-25.Una Fairy On the Edge"
+    )
+
+
+def test_folder_parser_preserves_release_name_and_ambiguous_dates():
+    parsed = parse_tpdb_folder_name(
+        "NylonPerv.25.10.10.Mia.Trejsi.Pantyhose.Princess.Fucked.Then.Pussy.Creamed.XXX.1080p.MP4-LEWD[XC]"
+    )
+
+    assert parsed.site == "nylonperv"
+    assert parsed.release_dates == ("2025-10-10", "2010-10-25")
+    assert parsed.name == "Mia Trejsi Pantyhose Princess Fucked Then Pussy Creamed"
 
 
 def test_fallback_query_plan_keeps_all_dates_and_performer_hints_within_bound():
@@ -148,11 +176,59 @@ def test_filename_candidate_audit_explains_site_date_and_name_rejections():
 
 
 def test_filename_without_date_is_not_auto_matched():
-    parsed = parse_tpdb_filename("Deeper.Kayden.Kross.and.Kenna.James.mp4")
+    parsed = parse_tpdb_filename("Una_Fairy-On_the_Edge.mp4")
 
-    assert parsed.site == "deeper"
+    assert parsed.site == ""
     assert parsed.release_date == ""
+    assert parsed.name == "Una Fairy On the Edge"
+    assert [variant.query for variant in build_search_variants(parsed)] == ["Una Fairy On the Edge"]
     assert select_unique_candidate(parsed, [_candidate("whale")]) is None
+
+
+def test_filename_without_date_does_not_promote_an_unverified_first_token_to_site():
+    filename = "Deeper.Kayden.Kross.and.Kenna.James.mp4"
+    parsed = parse_tpdb_filename(filename)
+
+    assert parsed.site == ""
+    assert parsed.name == "Deeper Kayden Kross and Kenna James"
+    assert find_known_entities(filename, KnownEntities(sites=("Deeper",))).sites == ("Deeper",)
+
+
+def test_full_filename_title_fallback_matches_title_without_site_or_date():
+    candidate = {
+        "slug": "manyvidsfanthomasger-una-fairy-on-the-edge",
+        "title": "Una Fairy - On The Edge",
+        "site": {"name": "Manyvids: Fanthomas_ger", "short_name": "manyvidsfanthomasger"},
+        "performers": [],
+    }
+
+    matches, counts, examples = explain_full_filename_title_candidates("Una_Fairy-On_the_Edge.mp4", [candidate])
+
+    assert matches == [candidate]
+    assert counts == {"candidates": 1, "matched": 1, "name_mismatch": 0}
+    assert "name_score=100.0" in examples[0]
+
+
+def test_full_filename_title_fallback_rejects_unrelated_and_ambiguous_candidates():
+    candidate = {
+        "slug": "edge-scene",
+        "title": "Una Fairy - On The Edge",
+        "duration": 1545,
+        "site": {"name": "Manyvids"},
+        "performers": [],
+    }
+    unrelated = {**candidate, "slug": "unrelated", "title": "A Different Scene"}
+    duplicate = {**candidate, "slug": "edge-scene-duplicate", "duration": 1600}
+
+    matches, counts, _ = explain_full_filename_title_candidates(
+        "Una_Fairy-On_the_Edge.mp4", [candidate, unrelated, duplicate]
+    )
+
+    assert matches == [candidate, duplicate]
+    assert counts == {"candidates": 3, "matched": 2, "name_mismatch": 1}
+    duration_matches, duration_counts, _ = explain_duration_candidates(matches, 1545)
+    assert duration_matches == []
+    assert duration_counts["ambiguous"] == 2
 
 
 def test_successful_nfo_entities_are_persisted_and_matched_from_basename(tmp_path):
@@ -174,6 +250,27 @@ def test_successful_nfo_entities_are_persisted_and_matched_from_basename(tmp_pat
     assert matched.performers == ("Evelyn Claire",)
 
 
+def test_known_entity_dictionary_is_cached_and_refreshes_after_update(monkeypatch, tmp_path):
+    import mdcx.crawlers.theporndb_knowledge as knowledge
+
+    original_read = knowledge._read
+    read_count = 0
+
+    def counted_read(path):
+        nonlocal read_count
+        read_count += 1
+        return original_read(path)
+
+    monkeypatch.setattr(knowledge, "_read", counted_read)
+    assert knowledge.load_known_entities(tmp_path) == KnownEntities()
+    assert knowledge.load_known_entities(tmp_path) == KnownEntities()
+    assert read_count == 1
+
+    knowledge.remember_entities(studios=["Gamma Enterprises"], data_folder=tmp_path)
+    assert knowledge.load_known_entities(tmp_path).studios == ("Gamma Enterprises",)
+    assert read_count == 2
+
+
 def test_known_entity_matching_requires_name_boundaries_but_allows_punctuationless_names():
     known = KnownEntities(sites=("BlackedRaw",), performers=("Evelyn Claire",))
 
@@ -185,6 +282,16 @@ def test_known_entity_matching_requires_name_boundaries_but_allows_punctuationle
     assert find_known_entities("BlackedRaw_Evelyn_Claire-Trouble.mp4", known) == matched
     assert partial.sites == ()
     assert partial.performers == ()
+
+
+def test_known_entities_can_be_scoped_to_a_folder_name_without_changing_file_lookup():
+    known = KnownEntities(sites=("NylonPerv",), performers=("Mia Trejsi",))
+    folder = "NylonPerv.25.10.10.Mia.Trejsi.Scene.Title"
+
+    assert find_known_entities_in_name(folder, known) == KnownEntities(
+        sites=("NylonPerv",), performers=("Mia Trejsi",)
+    )
+    assert find_known_entities("/library/NylonPerv/MiaScene.mp4", known) == KnownEntities()
 
 
 def test_corrupt_dictionary_is_not_overwritten(tmp_path):
@@ -228,6 +335,17 @@ def test_duration_tolerance_is_fixed_at_three_minutes():
     assert duration_within_tolerance(1800, 1980)
     assert not duration_within_tolerance(1800, 1981)
     assert not duration_within_tolerance(3600, 3900)
+
+
+def test_shared_duration_parser_keeps_provider_units_explicit():
+    from mdcx.utils.video import parse_duration_seconds
+
+    assert parse_duration_seconds("1h 20 min") == 4800
+    assert parse_duration_seconds("80 min") == 4800
+    assert parse_duration_seconds(80, bare_unit="minutes") == 4800
+    assert parse_duration_seconds(4800, bare_unit="seconds") == 4800
+    assert parse_duration_seconds("01:20:00", bare_unit="seconds") == 4800
+    assert parse_duration_seconds("not a runtime") is None
 
 
 def test_known_entity_fallback_keeps_multiple_in_range_candidates_ambiguous():

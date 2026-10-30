@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import asyncio
 import re
+from pathlib import Path
 from typing import Literal, override
 from urllib.parse import quote, urlencode
 
@@ -9,19 +10,22 @@ import oshash
 from ..config.enums import Switch, Website
 from ..config.manager import manager
 from .base import BaseCrawler, Context, CralwerException, CrawlerData
-from .theporndb_knowledge import find_known_entities, load_known_entities
+from .theporndb_knowledge import compact_name, find_known_entities, find_known_entities_in_name, load_known_entities
 from .theporndb_match import (
     DURATION_TOLERANCE_SECONDS,
     MATCH_THRESHOLD,
+    ParsedTPDBFilename,
     build_entity_search_specs,
     build_search_variants,
     candidate_audit_summary,
     explain_duration_candidates,
     explain_filename_candidates,
+    explain_full_filename_title_candidates,
     explain_known_entity_candidates,
     get_media_duration_seconds,
     merge_candidates,
     parse_tpdb_filename,
+    parse_tpdb_folder_name,
 )
 
 TheporndbKind = Literal["scenes", "movies"]
@@ -159,13 +163,30 @@ class TheporndbCrawler(BaseCrawler):
         parsed,
         existing_candidates: list[dict],
         headers: dict[str, str],
+        *,
+        hint_name: str | None = None,
+        hint_source: str = "文件名",
     ) -> list[dict]:
         known = load_known_entities()
-        matched = find_known_entities(file_path, known)
-        vendor_hints = tuple(dict.fromkeys((parsed.site, *matched.vendors)))
+        matched = (
+            find_known_entities(file_path, known)
+            if hint_name is None
+            else find_known_entities_in_name(hint_name, known)
+        )
         release_dates = parsed.release_dates
+        # The folder's parsed site/date/title already gets the normal search pass;
+        # this dictionary pass only trusts learned vendor names, not its first token.
+        site_hint = parsed.site if hint_source == "文件名" else ""
+        vendor_hints_list = []
+        seen_vendor_keys: set[str] = set()
+        for vendor in (site_hint, *matched.vendors):
+            vendor_key = compact_name(vendor)
+            if vendor and vendor_key not in seen_vendor_keys:
+                vendor_hints_list.append(vendor)
+                seen_vendor_keys.add(vendor_key)
+        vendor_hints = tuple(vendor_hints_list)
         ctx.debug(
-            "词典实体识别: "
+            f"{hint_source}词典实体识别: "
             f"sites={', '.join(matched.sites) or '-'}, "
             f"studios={', '.join(matched.studios) or '-'}, "
             f"performers={', '.join(matched.performers) or '-'}; "
@@ -173,21 +194,24 @@ class TheporndbCrawler(BaseCrawler):
             f"performers={len(known.performers)}"
         )
         ctx.debug(f"候选提示: vendors/sites={', '.join(vendor_hints) or '-'}, dates={' | '.join(release_dates) or '-'}")
+        if hint_source == "父文件夹" and not (matched.vendors or matched.performers or release_dates):
+            ctx.debug("父文件夹兜底跳过：目录名没有已知实体或有效日期")
+            return []
         if not vendor_hints and not matched.performers and not release_dates:
-            ctx.debug("字典＋日期兜底跳过：文件名没有可用于筛选候选的实体或日期")
+            ctx.debug(f"字典＋日期兜底跳过：{hint_source}没有可用于筛选候选的实体或日期")
             return []
 
         ctx.debug(
-            "字典＋日期候选规则: 识别到的厂商/站点、演员分别作为可选约束；"
+            f"{hint_source}字典＋日期候选规则: 识别到的厂商/站点、演员分别作为可选约束；"
             "解析出的任一可能日期可命中，候选缺少日期时保留给时长阶段判断；"
-            "不要求文件名必须包含演员，也不在此阶段用时长做最终判断"
+            f"不要求{hint_source}必须包含演员，也不在此阶段用时长做最终判断"
         )
 
         candidates = list(existing_candidates)
         search_errors: list[str] = []
         query_specs = build_entity_search_specs(vendor_hints, matched.performers, release_dates)
         ctx.debug(
-            f"字典＋日期查询计划: {len(query_specs)} 条（保留全部日期解释，文件名厂商优先）"
+            f"{hint_source}字典＋日期查询计划: {len(query_specs)} 条（保留全部日期解释）"
         )
 
         for site, query_text in query_specs:
@@ -197,7 +221,7 @@ class TheporndbCrawler(BaseCrawler):
             query_params["per_page"] = 100
             params = urlencode(query_params)
             search_url = f"{self.base_url}/{kind}?{params}"
-            ctx.debug(f"字典＋日期候选补充请求: {search_url}")
+            ctx.debug(f"{hint_source}字典＋日期候选补充请求: {search_url}")
             ctx.debug_info.search_urls = [*(ctx.debug_info.search_urls or []), search_url]
             try:
                 response, error = await self.async_client.get_json(search_url, headers=headers)
@@ -242,21 +266,125 @@ class TheporndbCrawler(BaseCrawler):
             candidates,
             matched,
             release_dates=release_dates,
-            site_hint=parsed.site,
+            site_hint=site_hint,
         )
         ctx.debug(
-            "字典＋日期候选筛选统计: "
+            f"{hint_source}字典＋日期候选筛选统计: "
             f"候选={audit_counts['candidates']}, 符合条件={audit_counts['eligible']}, "
             f"厂商不符={audit_counts['vendor_mismatch']}, 演员不符={audit_counts['performer_mismatch']}, "
             f"日期不符={audit_counts['date_mismatch']}, 日期未知={audit_counts['date_unknown']}, "
             f"缺少筛选提示={audit_counts['missing_hints']}"
         )
         for example in audit_examples:
-            ctx.debug(f"字典＋日期候选样本: {example}")
-        ctx.debug(f"字典＋日期兜底候选数: {len(matches)}")
+            ctx.debug(f"{hint_source}字典＋日期候选样本: {example}")
+        ctx.debug(f"{hint_source}字典＋日期兜底候选数: {len(matches)}")
         if search_errors:
             ctx.debug(f"候选补充搜索错误: {'; '.join(search_errors)}")
         return matches
+
+    async def _search_by_filename_candidates(
+        self,
+        ctx: Context,
+        kind: TheporndbKind,
+        parsed: ParsedTPDBFilename,
+        existing_candidates: list[dict],
+        headers: dict[str, str],
+        *,
+        hint_source: str,
+    ) -> tuple[list[dict], list[dict], list[str], str]:
+        """Run the same filename-style query and strict candidate check for either name source."""
+        variants = build_search_variants(parsed)
+        ctx.debug(
+            f"{hint_source}解析: site={parsed.site or '-'}, "
+            f"dates={' | '.join(parsed.release_dates) or '-'}, name={parsed.name or '-'}"
+        )
+        ctx.debug(
+            f"{hint_source}查询计划: variants={len(variants)}, "
+            f"queries={' | '.join(variant.query for variant in variants) or '-'}"
+        )
+        ctx.debug(
+            f"{hint_source}候选规则: site_match、发布日期命中任一解析结果，"
+            f"并且标题/演员组合 name_score≥{MATCH_THRESHOLD:.1f}"
+        )
+
+        candidates = list(existing_candidates)
+        search_errors: list[str] = []
+        last_search_url = ""
+        ambiguous_dates = len(parsed.release_dates) > 1
+        for variant_index, variant in enumerate(variants, start=1):
+            query = "parse" if kind == "scenes" else "q"
+            encoded_query = quote(variant.query, safe=".-_")
+            last_search_url = f"{self.base_url}/{kind}?{query}={encoded_query}&per_page=100"
+            ctx.debug(
+                f"{hint_source}查询 [{variant_index}/{len(variants)}] 开始: "
+                f"query={variant.query}, url={last_search_url}"
+            )
+            ctx.debug_info.search_urls = [*(ctx.debug_info.search_urls or []), last_search_url]
+            try:
+                response, error = await self.async_client.get_json(last_search_url, headers=headers)
+            except Exception as e:
+                error = f"{type(e).__name__}: {e}"
+                response = None
+            if response is None:
+                if "HTTP 401" in str(error):
+                    raise CralwerException("请检查 ThePornDB API Token 是否正确")
+                search_errors.append(str(error))
+                ctx.debug(f"{hint_source}查询请求失败: query={variant.query}, error={error}; 继续下一查询")
+                continue
+            if not isinstance(response, dict):
+                ctx.debug(
+                    f"{hint_source}查询响应格式异常: query={variant.query}, "
+                    f"response_type={type(response).__name__}; 继续下一查询"
+                )
+                continue
+
+            result_data = response.get("data") or []
+            if isinstance(result_data, dict):
+                result_data = [result_data]
+            old_candidate_count = len(candidates)
+            if isinstance(result_data, list):
+                candidates = merge_candidates(candidates, result_data)
+            matches, audit_counts, audit_examples = explain_filename_candidates(parsed, candidates)
+            ctx.debug(
+                f"{hint_source}查询响应: query={variant.query}, "
+                f"returned={len(result_data) if isinstance(result_data, list) else 0}, "
+                f"新增去重候选={len(candidates) - old_candidate_count}, 累计候选={len(candidates)}"
+            )
+            ctx.debug(
+                f"{hint_source}候选筛选统计: "
+                f"候选={audit_counts['candidates']}, 命中={audit_counts['matched']}, "
+                f"站点不符={audit_counts['site_mismatch']}, 日期缺失={audit_counts['date_missing']}, "
+                f"日期不符={audit_counts['date_mismatch']}, 名称分低于阈值={audit_counts['name_mismatch']}"
+            )
+            for example in audit_examples:
+                ctx.debug(f"{hint_source}候选判定: {example}")
+            if len(matches) == 1:
+                candidate_slug = matches[0].get("slug") or matches[0].get("id")
+                if candidate_slug:
+                    ctx.debug(
+                        f"原有逻辑暂定候选（尚未成功）: source={hint_source}, query={variant.query}, "
+                        f"{candidate_audit_summary(matches[0])}"
+                    )
+                    if not ambiguous_dates:
+                        break
+                    ctx.debug(f"{hint_source}日期存在多种解释，继续查询其余日期候选")
+                else:
+                    ctx.debug(f"{hint_source}唯一候选缺少 slug/id，继续更宽查询")
+            elif len(matches) > 1:
+                ctx.debug(f"{hint_source}查询产生 {len(matches)} 个候选: query={variant.query}，继续补齐候选")
+            else:
+                ctx.debug(f"{hint_source}查询未命中: query={variant.query}")
+
+        strict_candidates, audit_counts, audit_examples = explain_filename_candidates(parsed, candidates)
+        ctx.debug(
+            f"{hint_source}原有逻辑候选汇总: 接口结果={len(candidates)}, "
+            f"严格候选={len(strict_candidates)}, 站点不符={audit_counts['site_mismatch']}, "
+            f"日期缺失={audit_counts['date_missing']}, 日期不符={audit_counts['date_mismatch']}, "
+            f"名称不符={audit_counts['name_mismatch']}"
+        )
+        for example in audit_examples:
+            ctx.debug(f"{hint_source}候选: {example}")
+        return candidates, strict_candidates, search_errors, last_search_url
 
     @override
     async def _run(self, ctx: Context):
@@ -338,98 +466,14 @@ class TheporndbCrawler(BaseCrawler):
                 ctx.debug("Hash 阶段跳过: 按配置直接进入文件名搜索")
 
             parsed = parse_tpdb_filename(file_path)
-            variants = build_search_variants(parsed)
-            ctx.debug(
-                f"文件名解析: basename={file_path.rsplit('/', 1)[-1]}, "
-                f"site={parsed.site or '-'}, dates={' | '.join(parsed.release_dates) or '-'}, "
-                f"name={parsed.name or '-'}"
+            candidates, original_candidates, search_errors, last_search_url = await self._search_by_filename_candidates(
+                ctx,
+                kind,
+                parsed,
+                [],
+                headers,
+                hint_source="文件名",
             )
-            ctx.debug(
-                f"文件名查询计划: variants={len(variants)}, "
-                f"queries={' | '.join(variant.query for variant in variants) or '-'}"
-            )
-            ctx.debug(
-                "原有逻辑候选规则: site_match、发布日期命中任一解析结果，"
-                f"并且标题/演员组合 name_score≥{MATCH_THRESHOLD:.1f}"
-            )
-            candidates: list[dict] = []
-            search_errors: list[str] = []
-            last_search_url = ""
-            ambiguous_dates = len(parsed.release_dates) > 1
-            for variant_index, variant in enumerate(variants, start=1):
-                query = "parse" if kind == "scenes" else "q"
-                encoded_query = quote(variant.query, safe=".-_")
-                last_search_url = f"{self.base_url}/{kind}?{query}={encoded_query}&per_page=100"
-                ctx.debug(
-                    f"文件名查询 [{variant_index}/{len(variants)}] 开始: "
-                    f"query={variant.query}, url={last_search_url}"
-                )
-                ctx.debug_info.search_urls = [*(ctx.debug_info.search_urls or []), last_search_url]
-                try:
-                    res_search, error = await self.async_client.get_json(last_search_url, headers=headers)
-                except Exception as e:
-                    error = f"{type(e).__name__}: {e}"
-                    res_search = None
-                if res_search is None:
-                    if "HTTP 401" in str(error):
-                        ctx.debug(f"文件名查询认证失败: {error}")
-                        raise CralwerException("请检查 ThePornDB API Token 是否正确")
-                    search_errors.append(str(error))
-                    ctx.debug(f"文件名查询请求失败: query={variant.query}, error={error}; 继续下一查询")
-                    continue
-                if not isinstance(res_search, dict):
-                    ctx.debug(
-                        f"文件名查询响应格式异常: query={variant.query}, "
-                        f"response_type={type(res_search).__name__}; 继续下一查询"
-                    )
-                    continue
-
-                result_data = res_search.get("data") or []
-                if isinstance(result_data, dict):
-                    result_data = [result_data]
-                old_candidate_count = len(candidates)
-                if isinstance(result_data, list):
-                    candidates = merge_candidates(candidates, result_data)
-                matches, audit_counts, audit_examples = explain_filename_candidates(parsed, candidates)
-                ctx.debug(
-                    f"文件名查询响应: query={variant.query}, "
-                    f"returned={len(result_data) if isinstance(result_data, list) else 0}, "
-                    f"新增去重候选={len(candidates) - old_candidate_count}, 累计候选={len(candidates)}"
-                )
-                ctx.debug(
-                    "文件名候选筛选统计: "
-                    f"候选={audit_counts['candidates']}, 命中={audit_counts['matched']}, "
-                    f"站点不符={audit_counts['site_mismatch']}, 日期缺失={audit_counts['date_missing']}, "
-                    f"日期不符={audit_counts['date_mismatch']}, 名称分低于阈值={audit_counts['name_mismatch']}"
-                )
-                for example in audit_examples:
-                    ctx.debug(f"文件名候选判定: {example}")
-                if len(matches) == 1:
-                    candidate_slug = matches[0].get("slug") or matches[0].get("id")
-                    if candidate_slug:
-                        ctx.debug(
-                            f"原有逻辑暂定候选（尚未成功）: query={variant.query}, "
-                            f"{candidate_audit_summary(matches[0])}"
-                        )
-                        if not ambiguous_dates:
-                            break
-                        ctx.debug("日期存在多种解释，继续查询其余日期候选")
-                    else:
-                        ctx.debug("唯一候选缺少 slug/id，继续更宽查询")
-                elif len(matches) > 1:
-                    ctx.debug(f"原有逻辑产生 {len(matches)} 个候选: query={variant.query}，继续补齐候选")
-                else:
-                    ctx.debug(f"文件名查询未命中: query={variant.query}")
-
-            original_candidates, original_counts, original_examples = explain_filename_candidates(parsed, candidates)
-            ctx.debug(
-                "阶段1 原有逻辑候选汇总: "
-                f"接口结果={len(candidates)}, 严格候选={len(original_candidates)}, "
-                f"站点不符={original_counts['site_mismatch']}, 日期缺失={original_counts['date_missing']}, "
-                f"日期不符={original_counts['date_mismatch']}, 名称不符={original_counts['name_mismatch']}"
-            )
-            for example in original_examples:
-                ctx.debug(f"阶段1 候选: {example}")
 
             if file_path not in self._duration_cache:
                 self._duration_cache[file_path] = await asyncio.to_thread(get_media_duration_seconds, file_path)
@@ -452,6 +496,7 @@ class TheporndbCrawler(BaseCrawler):
                 ctx.debug(f"阶段3 时长判定: {example}")
 
             match_source = ""
+            candidate_queue = list(original_candidates)
             if not selected_candidates:
                 ctx.debug("阶段1未得到唯一时长候选，进入阶段2：实体词典＋多格式日期补充候选")
                 fallback_candidates = await self._search_by_known_entities(
@@ -483,6 +528,117 @@ class TheporndbCrawler(BaseCrawler):
                     match_source = "原有逻辑/字典日期候选＋时长最终筛选"
             else:
                 match_source = "原有逻辑候选＋时长最终筛选"
+
+            if not selected_candidates:
+                title_candidate_queue = merge_candidates(candidates, candidate_queue)
+                title_candidates, title_counts, title_examples = explain_full_filename_title_candidates(
+                    file_path, title_candidate_queue
+                )
+                ctx.debug(
+                    "阶段3b 完整文件名标题兜底候选: "
+                    f"候选={title_counts['candidates']}, 标题命中={title_counts['matched']}, "
+                    f"标题不符={title_counts['name_mismatch']}"
+                )
+                for example in title_examples:
+                    ctx.debug(f"阶段3b 完整文件名标题判定: {example}")
+                selected_candidates, duration_counts, duration_examples = explain_duration_candidates(
+                    title_candidates, local_duration
+                )
+                ctx.debug(
+                    "阶段3b 标题候选时长确认: "
+                    f"候选={duration_counts['candidates']}, 容差内={duration_counts['within_tolerance']}, "
+                    f"时长不符={duration_counts['duration_mismatch']}, "
+                    f"时长未知={duration_counts['duration_unknown']}, "
+                    f"仍有歧义={duration_counts['ambiguous']}"
+                )
+                for example in duration_examples:
+                    ctx.debug(f"阶段3b 标题时长判定: {example}")
+                if selected_candidates:
+                    match_source = "完整文件名标题候选＋时长最终筛选"
+
+            if not selected_candidates:
+                folder_name = Path(file_path).parent.name
+                if folder_name:
+                    folder_parsed = parse_tpdb_folder_name(folder_name)
+                    ctx.debug(
+                        "阶段4 Hash/文件名匹配未得到唯一结果，直接父文件夹完整重跑名称匹配: "
+                        f"folder={folder_name}, site={folder_parsed.site or '-'}, "
+                        f"dates={' | '.join(folder_parsed.release_dates) or '-'}, "
+                        f"name={folder_parsed.name or '-'}"
+                    )
+                    (
+                        folder_api_candidates,
+                        folder_original_candidates,
+                        folder_search_errors,
+                        folder_last_search_url,
+                    ) = await self._search_by_filename_candidates(
+                        ctx,
+                        kind,
+                        folder_parsed,
+                        candidate_queue,
+                        headers,
+                        hint_source="父文件夹",
+                    )
+                    search_errors.extend(folder_search_errors)
+                    last_search_url = folder_last_search_url or last_search_url
+                    ctx.debug(
+                        f"阶段4 父文件夹原有逻辑候选: 接口候选={len(folder_api_candidates)}, "
+                        f"严格候选={len(folder_original_candidates)}"
+                    )
+                    (
+                        selected_candidates,
+                        duration_counts,
+                        duration_examples,
+                    ) = explain_duration_candidates(folder_original_candidates, local_duration)
+                    ctx.debug(
+                        "阶段4 父文件夹文件名候选时长筛选: "
+                        f"候选={duration_counts['candidates']}, 容差内={duration_counts['within_tolerance']}, "
+                        f"时长不符={duration_counts['duration_mismatch']}, "
+                        f"时长未知={duration_counts['duration_unknown']}, "
+                        f"仍有歧义={duration_counts['ambiguous']}"
+                    )
+                    for example in duration_examples:
+                        ctx.debug(f"阶段4 父文件夹文件名时长判定: {example}")
+
+                    if selected_candidates:
+                        match_source = "父文件夹原有文件名候选＋时长最终筛选"
+                    else:
+                        ctx.debug("阶段4 父文件夹文件名逻辑未唯一通过，继续父文件夹实体词典＋日期兜底")
+                        folder_dictionary_candidates = await self._search_by_known_entities(
+                            ctx,
+                            kind,
+                            file_path,
+                            folder_parsed,
+                            folder_api_candidates,
+                            headers,
+                            hint_name=folder_name,
+                            hint_source="父文件夹",
+                        )
+                        folder_candidate_queue = merge_candidates(
+                            folder_original_candidates,
+                            folder_dictionary_candidates,
+                        )
+                        ctx.debug(
+                            f"阶段4 父文件夹候选合并: 名称严格候选={len(folder_original_candidates)}, "
+                            f"字典＋日期候选={len(folder_dictionary_candidates)}, "
+                            f"去重后={len(folder_candidate_queue)}"
+                        )
+                        selected_candidates, duration_counts, duration_examples = explain_duration_candidates(
+                            folder_candidate_queue, local_duration
+                        )
+                        ctx.debug(
+                            "阶段4 父文件夹字典候选时长筛选: "
+                            f"候选={duration_counts['candidates']}, 容差内={duration_counts['within_tolerance']}, "
+                            f"时长不符={duration_counts['duration_mismatch']}, "
+                            f"时长未知={duration_counts['duration_unknown']}, "
+                            f"仍有歧义={duration_counts['ambiguous']}"
+                        )
+                        for example in duration_examples:
+                            ctx.debug(f"阶段4 父文件夹字典时长判定: {example}")
+                        if selected_candidates:
+                            match_source = "文件名/父文件夹词典日期候选＋时长最终筛选"
+                else:
+                    ctx.debug("阶段4 父文件夹兜底跳过：视频文件没有可用的父目录名")
 
             if selected_candidates:
                 selected = selected_candidates[0]
