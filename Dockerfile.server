@@ -62,7 +62,8 @@ RUN apt-get update \
     && uv run --no-sync python -m PyInstaller --version \
     && uv run --no-sync python scripts/build.py --no-color
 
-FROM stainless403/mdcx-builtin-gui-base:mdcx-tpdb-capture-220260923
+ARG MDCX_RUNTIME_IMAGE=stainless403/mdcx-builtin-gui-base:mdcx-tpdb-capture-220260923
+FROM ${MDCX_RUNTIME_IMAGE}
 
 COPY --from=build /src/dist/MDCx /app/MDCx
 RUN chmod 0755 /app/MDCx
