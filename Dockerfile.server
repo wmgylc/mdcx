@@ -25,7 +25,7 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     uv sync --locked --group dev --no-install-project
 
 RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends binutils libglib2.0-0t64 \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends binutils libgl1 libglib2.0-0t64 \
     && rm -rf /var/lib/apt/lists/* \
     && uv run --no-sync ruff check \
         mdcx/config/extend.py \
